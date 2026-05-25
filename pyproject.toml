@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skybounce-app-logistics"
+version = "0.1.0"
+description = "SkyBounce streaming event engine for logistics / vehicle telemetry"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Proprietary" }
+authors = [
+    { name = "Imaginary Root Studio LLC" },
+]
+
+# Runtime dependencies:
+# - skybounce-event-rules: shared rule library (this is the whole point)
+# - skybounce_IPC_python is required at runtime ONLY when --transport ipc is
+#   used. The file transport has no IPC dependency, which lets us run on
+#   workstations for replay validation without the protocol stack installed.
+# numpy is allowed for scalar math convenience but not for vectorization.
+dependencies = [
+    "skybounce-event-rules>=0.1.0",
+    "numpy>=1.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+# Validation extra: only needed when running scripts/compare_to_analyzer.py
+# against the PC analyzer's events CSV output. NOT needed on the Pi.
+validation = [
+    "pandas>=2.0",
+]
+
+[project.scripts]
+sb-logistics-replay = "skybounce_app_logistics.scripts.replay:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v"
