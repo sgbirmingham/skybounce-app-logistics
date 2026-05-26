@@ -57,8 +57,11 @@ The comparison tool reports matched, missed, extra, and same-timestamp-different
 - `csv_source.py` — `batch_frames()` for replay over closed files, `tail_frames()` for live operation.
 - `state.py` — `StreamingState` (per-session state: prev values, EWMA, debounce, anchors) and `process_frame()` (one-row feature computation).
 - `engine.py` — `StreamingEngine` (event detection, interval tracking, emission).
-- `transport.py` — `FileTransport` (JSON lines to disk) and `IpcTransport` (encode SB45 + submit to IPC client).
-- `scripts/replay.py` — CLI entry point.
+- `transport.py` — `FileTransport` (JSON lines to disk) and `IpcTransport` (encode SB45 + submit to IPC client; registers CMD / TELEMETRY_ACK / STATUS handlers for app-layer visibility).
+- `scripts/replay.py` — offline replay CLI (`sb-logistics-replay`).
+- `scripts/live.py` — live tail-and-stream CLI (`sb-logistics-live`).
+
+Both CLIs accept `--transport {file,ipc}` (default `file`). With `--transport ipc`, pass `--socket PATH` and `--endpoint-id ID` to override the defaults.
 
 ## Live operation (Pi side)
 
@@ -68,8 +71,17 @@ python vehicle_behavior_simple_logger_v0_1.py \
     --interval-s 1.0 \
     --out-dir /home/sgbir/coldchain_poc/data/simple_logger/raw &
 
-# Wait for it to create a CSV, then attach the streaming engine.
-# (Add a --tail / --live mode wrapper if needed.)
+# Attach the streaming engine, file transport (default; for dev / debugging):
+python -m skybounce_app_logistics.scripts.live \
+    --watch /home/sgbir/coldchain_poc/data/simple_logger/raw \
+    --out   /home/sgbir/coldchain_poc/data/events/live.jsonl
+
+# Or, attach with IPC transport (for real radio operation):
+python -m skybounce_app_logistics.scripts.live \
+    --watch /home/sgbir/coldchain_poc/data/simple_logger/raw \
+    --transport ipc \
+    --socket /tmp/skybounce-sensor.sock \
+    --endpoint-id 0x53415050
 ```
 
 The streaming engine is designed to run in a separate process from the logger so a crash on either side doesn't take the other down with it.
