@@ -1,0 +1,12 @@
+@"
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+
+# IDE
+.idea/
+
+# Local outputs
+out/
+"@ | Set-Content -Path .gitignore -Encoding UTF8

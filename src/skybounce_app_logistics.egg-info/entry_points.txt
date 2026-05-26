@@ -1,2 +1,0 @@
-[console_scripts]
-sb-logistics-replay = skybounce_app_logistics.scripts.replay:main

@@ -1,8 +1,0 @@
-skybounce-event-rules>=0.1.0
-numpy>=1.20
-
-[dev]
-pytest>=7.0
-
-[validation]
-pandas>=2.0
