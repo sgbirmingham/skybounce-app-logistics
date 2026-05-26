@@ -45,10 +45,16 @@ from skybounce_event_rules import AnalyzerConfig, RULES_VERSION
 
 from ..csv_source import tail_frames
 from ..engine import StreamingEngine
-from ..transport import FileTransport
+from ..transport import FileTransport, IpcTransport
 
 
 log = logging.getLogger("skybounce.app.logistics.live")
+
+
+# v0.1 placeholder endpoint_id. "SAPP" in ASCII; matches the IPC repo's
+# sensor_app_stub default so bench validation sees a consistent peer id.
+# Real deployments should set a meaningful per-device value.
+DEFAULT_ENDPOINT_ID = 0x53415050
 
 
 # -----------------------------------------------------------------------------
@@ -99,8 +105,20 @@ def main() -> None:
     group.add_argument("--watch", type=Path,
                        help="Directory containing logger CSVs. The newest is used.")
 
-    parser.add_argument("--out", required=True, type=Path,
-                       help="Where to append the JSON-lines event log.")
+    parser.add_argument("--out", type=Path,
+                       help="Where to append the JSON-lines event log. "
+                            "Required for --transport file; ignored for "
+                            "--transport ipc.")
+    parser.add_argument("--transport", choices=("file", "ipc"), default="file",
+                       help="Where to emit events. 'file' appends JSONL to --out; "
+                            "'ipc' submits SB45 via the SkyBounce IPC daemon.")
+    parser.add_argument("--socket", type=str, default=None,
+                       help="Unix socket path for --transport ipc. Overrides "
+                            "$SKYBOUNCE_SENSOR_SOCK; library default if unset.")
+    parser.add_argument("--endpoint-id", type=lambda x: int(x, 0),
+                       default=DEFAULT_ENDPOINT_ID,
+                       help="32-bit endpoint identifier sent in HELLO "
+                            "(--transport ipc only). Decimal, 0x hex, or 0o octal.")
     parser.add_argument("--stop-on-idle", action="store_true",
                        help="Exit if no new rows appear for ~5 seconds. "
                             "Useful for ad-hoc tests; do NOT use during driving.")
@@ -124,9 +142,30 @@ def main() -> None:
             sys.exit(2)
         csv_path = find_latest_logger_csv(watch_dir)
 
+    # Select transport.
+    if args.transport == "file":
+        if args.out is None:
+            parser.error("--out is required with --transport file")
+        transport = FileTransport(args.out, mode="a")  # append: multiple
+                                                       # invocations preserve history
+        out_descr = str(args.out)
+    else:
+        if args.out is not None:
+            log.warning("--out %s ignored when --transport ipc", args.out)
+        try:
+            transport = IpcTransport(
+                endpoint_id=args.endpoint_id,
+                socket_path=args.socket,
+            )
+        except ImportError as e:
+            parser.error(f"--transport ipc requires skybounce_IPC_python: {e}")
+            return  # unreachable; parser.error exits
+        out_descr = f"IPC endpoint_id=0x{args.endpoint_id:08X}"
+
     print(f"Rules library: {RULES_VERSION}")
     print(f"Tailing:       {csv_path}")
-    print(f"Output:        {args.out}")
+    print(f"Transport:     {args.transport}")
+    print(f"Output:        {out_descr}")
     if args.stop_on_idle:
         print("Will exit when no new rows appear for ~5 seconds.")
     else:
@@ -144,8 +183,6 @@ def main() -> None:
     signal.signal(signal.SIGINT, _on_sigint)
 
     cfg = AnalyzerConfig()
-    transport = FileTransport(args.out, mode="a")  # append, so multiple
-                                                    # invocations don't lose history
     engine = StreamingEngine(transport=transport, cfg=cfg)
 
     last_status_print = time.monotonic()
