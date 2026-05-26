@@ -250,6 +250,140 @@ def update_state_window(
     return None
 
 
+# =============================================================================
+# Persistent-condition tracker (v0.2)
+# =============================================================================
+
+@dataclass
+class PersistentConditionTracker:
+    """Tracks one continuous "condition true" interval and decides when to emit.
+
+    Streaming analog of the analyzer's detect_persistent_condition() loop.
+    The condition is evaluated per frame by the caller (engine), via the rules
+    library's is_gps_bad() / is_gps_loss_while_moving() scalar helpers; this
+    class manages the duration tracking, gps_confidence + speed_mph
+    accumulation, and the flip-to-false emit decision.
+
+    Mirrors add_interval_event's contract:
+      - event stamped on the LAST in-condition row
+      - duration = ts(last in-condition) - ts(first in-condition)
+      - avg_speed_mph = mean(speed_mph) over the in-condition window
+      - score = 1.0 - mean(gps_confidence) over the in-condition window
+
+    Lifecycle:
+        tracker.step(condition=False, ...)   # idle, returns None
+        tracker.step(condition=True, ts=100, ...)   # enters, returns None
+        tracker.step(condition=True, ts=101, ...)   # accumulates, returns None
+        tracker.step(condition=True, ts=102, ...)   # accumulates, returns None
+        tracker.step(condition=False, ts=103, ...)  # flip-to-false: returns
+                                                    # emit-spec if duration ok
+        tracker.step(condition=False, ...)   # idle again, returns None
+    """
+    event_type: str            # "gps_degraded_persistent" or "gps_loss_while_moving"
+    min_duration_s: float      # cfg.gps_degraded_min_duration_s or gps_loss_while_moving_min_s
+    score: float = 0.65        # placeholder; replaced by tracker's avg-confidence score on emit
+
+    active: bool = False
+    start_ts: Optional[float] = None
+    last_in_state_ts: Optional[float] = None
+    gps_confidence_sum: float = 0.0
+    speed_mph_sum: float = 0.0
+    sample_count: int = 0
+
+    def step(
+        self,
+        condition: bool,
+        ts: float,
+        gps_confidence: float,
+        speed_m_s: float,
+    ) -> Optional[dict]:
+        """Advance one frame.
+
+        Returns an emit-spec dict on flip-to-false past threshold, else None.
+
+        Emit-spec keys:
+            event_type:        the configured event type string
+            last_in_state_ts:  ts to stamp the event with
+            duration_s:        ts(last) - ts(first)
+            score:             1.0 - (gps_confidence_sum / sample_count)
+            avg_speed_mph:     speed_mph_sum / sample_count
+            avg_gps_confidence: gps_confidence_sum / sample_count (for caller use)
+        """
+        if condition:
+            if not self.active:
+                # Enter the in-condition window. First frame: pin start.
+                self.active = True
+                self.start_ts = ts
+                self.last_in_state_ts = ts
+                self.gps_confidence_sum = gps_confidence
+                self.speed_mph_sum = speed_m_s * 2.23694
+                self.sample_count = 1
+            else:
+                # Already in the window; extend.
+                self.last_in_state_ts = ts
+                self.gps_confidence_sum += gps_confidence
+                self.speed_mph_sum += speed_m_s * 2.23694
+                self.sample_count += 1
+            return None
+
+        # condition is False
+        if not self.active:
+            # Idle. Nothing to do.
+            return None
+
+        # Flip-to-false: window just closed. Decide whether to emit.
+        start_ts = self.start_ts if self.start_ts is not None else ts
+        last_in_state_ts = self.last_in_state_ts if self.last_in_state_ts is not None else ts
+        duration_s = last_in_state_ts - start_ts
+
+        emit_spec: Optional[dict] = None
+        if duration_s >= self.min_duration_s and self.sample_count > 0:
+            avg_gps_conf = self.gps_confidence_sum / self.sample_count
+            avg_speed_mph = self.speed_mph_sum / self.sample_count
+            emit_spec = {
+                "event_type": self.event_type,
+                "last_in_state_ts": last_in_state_ts,
+                "duration_s": duration_s,
+                "score": 1.0 - avg_gps_conf,
+                "avg_speed_mph": avg_speed_mph,
+                "avg_gps_confidence": avg_gps_conf,
+            }
+
+        # Reset for the next episode.
+        self.active = False
+        self.start_ts = None
+        self.last_in_state_ts = None
+        self.gps_confidence_sum = 0.0
+        self.speed_mph_sum = 0.0
+        self.sample_count = 0
+        return emit_spec
+
+    def flush(self) -> Optional[dict]:
+        """End-of-session: if currently active and past threshold, emit.
+
+        Mirrors detect_persistent_condition's tail block at line 588-594 of
+        edge_analyzer: if condition is still active when the stream ends,
+        treat the last in-state row as the closing edge.
+        """
+        if not self.active or self.sample_count == 0:
+            return None
+        start_ts = self.start_ts if self.start_ts is not None else 0.0
+        last_in_state_ts = self.last_in_state_ts if self.last_in_state_ts is not None else start_ts
+        duration_s = last_in_state_ts - start_ts
+        if duration_s < self.min_duration_s:
+            return None
+        avg_gps_conf = self.gps_confidence_sum / self.sample_count
+        avg_speed_mph = self.speed_mph_sum / self.sample_count
+        return {
+            "event_type": self.event_type,
+            "last_in_state_ts": last_in_state_ts,
+            "duration_s": duration_s,
+            "score": 1.0 - avg_gps_conf,
+            "avg_speed_mph": avg_speed_mph,
+            "avg_gps_confidence": avg_gps_conf,
+        }
+
+
 def process_frame(
     state: StreamingState,
     frame: SensorFrame,

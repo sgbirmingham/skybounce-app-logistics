@@ -23,6 +23,8 @@ from skybounce_event_rules import (
     RULES_VERSION,
     classify_event_policy,
     cooldown_ok,
+    is_gps_bad,
+    is_gps_loss_while_moving,
     is_hard_accel,
     is_hard_brake,
     is_moderate_impact,
@@ -30,7 +32,13 @@ from skybounce_event_rules import (
 )
 
 from .csv_source import SensorFrame
-from .state import ComputedFeatures, StreamingState, process_frame, update_state_window
+from .state import (
+    ComputedFeatures,
+    PersistentConditionTracker,
+    StreamingState,
+    process_frame,
+    update_state_window,
+)
 from .transport import Event, Transport
 
 
@@ -113,6 +121,19 @@ class StreamingEngine:
         self._startup_acquired_emitted = False
         self._startup_acquiring_emitted = False
 
+        # Persistent-condition trackers (v0.2).
+        # One per event type. Each receives a per-frame condition decision
+        # (via the rules library's is_gps_bad / is_gps_loss_while_moving
+        # helpers) and emits on flip-to-false past its min_duration_s threshold.
+        self._gps_degraded_tracker = PersistentConditionTracker(
+            event_type="gps_degraded_persistent",
+            min_duration_s=self.cfg.gps_degraded_min_duration_s,
+        )
+        self._gps_loss_moving_tracker = PersistentConditionTracker(
+            event_type="gps_loss_while_moving",
+            min_duration_s=self.cfg.gps_loss_while_moving_min_s,
+        )
+
         log.info("streaming engine started, rules=%s", RULES_VERSION)
 
     # -------------------------------------------------------------------------
@@ -125,6 +146,7 @@ class StreamingEngine:
         self._detect_startup_events(feats)
         self._detect_point_events(feats, frame)
         self._update_state_tracking(feats)
+        self._update_persistent_conditions(feats)
 
     def flush(self) -> None:
         """Emit any pending interval events. Call at session end.
@@ -136,7 +158,21 @@ class StreamingEngine:
         Matches the analyzer's detect_state_intervals fallback at lines 622-625:
         if the final state runs to end-of-stream, it is emitted as an interval
         ending on the last row.
+
+        Also drains the persistent-condition trackers if their conditions are
+        still active at end-of-stream (mirrors detect_persistent_condition's
+        tail block at edge_analyzer lines 588-594).
         """
+        # Drain persistent-condition trackers first. Their stamps live on
+        # ts_epoch_s independently of state-window timing, so ordering with
+        # state events doesn't matter for correctness; we emit them first
+        # only for consistency with how the analyzer's detect_events()
+        # interleaves these (state events / persistent events / point events).
+        for tracker in (self._gps_degraded_tracker, self._gps_loss_moving_tracker):
+            spec = tracker.flush()
+            if spec is not None:
+                self._emit_persistent_condition_event(spec)
+
         if self._current_state is None:
             return
 
@@ -417,6 +453,81 @@ class StreamingEngine:
             speed_m_s=st.prev_speed_m_s if st.prev_speed_m_s is not None else 0.0,
             analyzer_state_candidate=state_name,
             analyzer_state=state_name,
+        )
+
+    # -------------------------------------------------------------------------
+    # Persistent-condition events (gps_degraded_persistent, gps_loss_while_moving)
+    # -------------------------------------------------------------------------
+
+    def _update_persistent_conditions(self, feats: ComputedFeatures) -> None:
+        """Evaluate the two persistent-condition detectors for this frame.
+
+        Mirrors edge_analyzer's detect_persistent_condition() calls at lines
+        770-791. The per-row condition checks are delegated to the rules
+        library (is_gps_bad / is_gps_loss_while_moving); the trackers manage
+        duration accumulation and the emit decision.
+
+        Suppress during the startup window, matching the analyzer's
+        operational = df[~df["startup_suppressed"]] split.
+        """
+        if feats.elapsed_s < self.cfg.startup_suppress_s:
+            return
+
+        # gps_degraded_persistent: GPS bad for >= cfg.gps_degraded_min_duration_s.
+        gps_bad = is_gps_bad(
+            gps_confidence=feats.gps_confidence,
+            gps_data_stale_flag=feats.gps_data_stale_flag,
+            gps_fix_stale=feats.gps_fix_stale,
+            cfg=self.cfg,
+        )
+        spec = self._gps_degraded_tracker.step(
+            condition=gps_bad,
+            ts=feats.ts_epoch_s,
+            gps_confidence=feats.gps_confidence,
+            speed_m_s=feats.speed_m_s,
+        )
+        if spec is not None:
+            self._emit_persistent_condition_event(spec)
+
+        # gps_loss_while_moving: gps_bad AND speed >= cfg.moving_speed_m_s.
+        gps_loss_moving = is_gps_loss_while_moving(
+            gps_confidence=feats.gps_confidence,
+            gps_data_stale_flag=feats.gps_data_stale_flag,
+            gps_fix_stale=feats.gps_fix_stale,
+            gps_speed_m_s=feats.speed_m_s,
+            cfg=self.cfg,
+        )
+        spec = self._gps_loss_moving_tracker.step(
+            condition=gps_loss_moving,
+            ts=feats.ts_epoch_s,
+            gps_confidence=feats.gps_confidence,
+            speed_m_s=feats.speed_m_s,
+        )
+        if spec is not None:
+            self._emit_persistent_condition_event(spec)
+
+    def _emit_persistent_condition_event(self, spec: dict) -> None:
+        """Emit a persistent-condition event from a tracker's emit-spec.
+
+        spec contains: event_type, last_in_state_ts, duration_s, score,
+                       avg_speed_mph, avg_gps_confidence.
+
+        Detail string matches analyzer's add_interval_event:
+            f"duration={d:.0f}s, avg_speed={s:.1f} mph"
+        """
+        detail = (
+            f"duration={spec['duration_s']:.0f}s, "
+            f"avg_speed={spec['avg_speed_mph']:.1f} mph"
+        )
+        snapshot = self._snapshot_features_at(
+            spec["last_in_state_ts"],
+            state_name=self.state.committed_state,
+        )
+        self._emit_event(
+            feats=snapshot,
+            event_type=spec["event_type"],
+            score=spec["score"],
+            detail=detail,
         )
 
     # -------------------------------------------------------------------------
