@@ -105,6 +105,15 @@ class StreamingState:
     pending_state: Optional[str] = None
     pending_start_ts: Optional[float] = None
 
+    # State-interval window. Tracks the currently-occupied committed state so
+    # we can stamp interval events (trip_start, state_highway, long_stop, etc.)
+    # on the LAST in-state row, matching the PC analyzer's add_interval_event
+    # convention (seg.iloc[-1]; duration = ts(last in-state) - ts(first in-state)).
+    state_window_start_ts: Optional[float] = None
+    state_window_last_ts: Optional[float] = None
+    state_window_speed_mph_sum: float = 0.0
+    state_window_sample_count: int = 0
+
     # Cooldown timestamps per event type
     last_event_ts: dict = field(default_factory=dict)
 
@@ -181,6 +190,64 @@ def _update_state_machine(
         state.pending_start_ts = None
 
     return state.committed_state
+
+
+def update_state_window(
+    state: StreamingState,
+    ts_epoch_s: float,
+    speed_m_s: float,
+    transitioned: bool,
+) -> Optional[tuple[float, float, float, int]]:
+    """Maintain the rolling window of the currently-occupied committed state.
+
+    Called once per frame by the engine. Tracks (start_ts, last_in_state_ts,
+    speed_mph_sum, sample_count) so interval events can be stamped on the LAST
+    in-state row and carry an avg_speed_mph that matches the analyzer's
+    seg["speed_mph"].mean().
+
+    Args:
+        transitioned: True if the committed state just changed from the
+            previous frame. The caller is responsible for that comparison.
+
+    Returns:
+        On a transition, a snapshot of the JUST-CLOSED window as
+        (start_ts, last_in_state_ts, speed_mph_sum, sample_count). The window
+        is then reset to start on the current frame (the first in-state row
+        of the new state).
+
+        Returns None on non-transition frames (window simply extended).
+
+    Notes:
+        Speeds are accumulated in mph to match add_interval_event's detail
+        string format. Conversion factor 2.23694 matches engine._emit_event.
+    """
+    speed_mph = speed_m_s * 2.23694
+
+    if transitioned:
+        snapshot = (
+            state.state_window_start_ts
+            if state.state_window_start_ts is not None
+            else ts_epoch_s,
+            state.state_window_last_ts
+            if state.state_window_last_ts is not None
+            else ts_epoch_s,
+            state.state_window_speed_mph_sum,
+            state.state_window_sample_count,
+        )
+        # Reset window to start on this (first in-state) row.
+        state.state_window_start_ts = ts_epoch_s
+        state.state_window_last_ts = ts_epoch_s
+        state.state_window_speed_mph_sum = speed_mph
+        state.state_window_sample_count = 1
+        return snapshot
+
+    # Same state as previous frame: extend the window.
+    if state.state_window_start_ts is None:
+        state.state_window_start_ts = ts_epoch_s
+    state.state_window_last_ts = ts_epoch_s
+    state.state_window_speed_mph_sum += speed_mph
+    state.state_window_sample_count += 1
+    return None
 
 
 def process_frame(

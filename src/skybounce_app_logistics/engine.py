@@ -30,7 +30,7 @@ from skybounce_event_rules import (
 )
 
 from .csv_source import SensorFrame
-from .state import ComputedFeatures, StreamingState, process_frame
+from .state import ComputedFeatures, StreamingState, process_frame, update_state_window
 from .transport import Event, Transport
 
 
@@ -106,7 +106,9 @@ class StreamingEngine:
         self._trackers: dict[str, IntervalTracker] = {}
         self._trip = TripContext()
         self._current_state: Optional[str] = None
-        self._current_state_start_ts: Optional[float] = None
+        # NB: _current_state_start_ts removed in the state-window refactor.
+        # Window timing (start_ts, last_ts, speed_sum, sample_count) now lives
+        # in StreamingState and is managed by update_state_window().
 
         self._startup_acquired_emitted = False
         self._startup_acquiring_emitted = False
@@ -125,18 +127,29 @@ class StreamingEngine:
         self._update_state_tracking(feats)
 
     def flush(self) -> None:
-        """Emit any pending interval events. Call at session end."""
-        if self._current_state is None or self._current_state_start_ts is None:
+        """Emit any pending interval events. Call at session end.
+
+        The state-window helper has been accumulating start_ts/last_ts/speed_sum
+        for the still-active state. We treat session-end as a transition with
+        no successor: emit the current window as a closed interval.
+
+        Matches the analyzer's detect_state_intervals fallback at lines 622-625:
+        if the final state runs to end-of-stream, it is emitted as an interval
+        ending on the last row.
+        """
+        if self._current_state is None:
             return
-        # Use the last seen ts as the synthetic "exit" timestamp.
-        last_ts = self.state.prev_ts_epoch_s
-        if last_ts is None:
+
+        st = self.state
+        if st.state_window_start_ts is None or st.state_window_last_ts is None:
             return
+
         self._maybe_emit_state_interval(
             state_name=self._current_state,
-            start_ts=self._current_state_start_ts,
-            end_ts=last_ts,
-            reason="session_end",
+            start_ts=st.state_window_start_ts,
+            last_in_state_ts=st.state_window_last_ts,
+            speed_sum_mph=st.state_window_speed_mph_sum,
+            sample_count=st.state_window_sample_count,
         )
 
     # -------------------------------------------------------------------------
@@ -235,6 +248,11 @@ class StreamingEngine:
 
         Mirrors the analyzer's detect_trip_events + detect_movement_state_summaries
         logic, but in forward-only streaming form.
+
+        The interval is stamped on the LAST in-state row (matching the
+        analyzer's add_interval_event seg.iloc[-1] convention), and the
+        avg_speed_mph in the detail string is the mean of speed_mph across
+        the in-state samples (matching seg["speed_mph"].mean()).
         """
         if feats.elapsed_s < self.cfg.startup_suppress_s:
             return
@@ -243,94 +261,121 @@ class StreamingEngine:
         if new_state in ("STARTUP_GPS_ACQUIRING", "STARTUP_GPS_READY"):
             return
 
-        # First post-startup state we see.
+        # First post-startup state we see. Initialize the window; nothing to emit.
         if self._current_state is None:
             self._current_state = new_state
-            self._current_state_start_ts = feats.ts_epoch_s
+            update_state_window(
+                self.state, feats.ts_epoch_s, feats.speed_m_s, transitioned=True,
+            )
             return
 
-        if new_state == self._current_state:
+        transitioned = new_state != self._current_state
+        snapshot = update_state_window(
+            self.state, feats.ts_epoch_s, feats.speed_m_s, transitioned=transitioned,
+        )
+
+        if not transitioned:
             return
 
-        # State transition. Emit interval event for the state we just left.
+        # Transition: snapshot is the just-closed state's window.
+        start_ts, last_in_state_ts, speed_sum, sample_count = snapshot
         self._maybe_emit_state_interval(
             state_name=self._current_state,
-            start_ts=self._current_state_start_ts or feats.ts_epoch_s,
-            end_ts=feats.ts_epoch_s,
-            reason="state_transition",
+            start_ts=start_ts,
+            last_in_state_ts=last_in_state_ts,
+            speed_sum_mph=speed_sum,
+            sample_count=sample_count,
         )
 
         self._current_state = new_state
-        self._current_state_start_ts = feats.ts_epoch_s
 
     def _maybe_emit_state_interval(
         self,
         state_name: str,
         start_ts: float,
-        end_ts: float,
-        reason: str,
+        last_in_state_ts: float,
+        speed_sum_mph: float,
+        sample_count: int,
     ) -> None:
         """Decide whether the just-ended interval is worth emitting as an event.
 
         Mirrors detect_trip_events() and detect_movement_state_summaries()
         for the cases that fit forward-only streaming.
+
+        Duration is computed as ts(last in-state) - ts(first in-state), and
+        the detail string format is `f"duration={d:.0f}s, avg_speed={s:.1f} mph"`
+        plus any per-event suffix, exactly matching add_interval_event.
         """
         cfg = self.cfg
-        duration = end_ts - start_ts
+        duration = last_in_state_ts - start_ts
         if duration < cfg.min_state_duration_s:
             return
 
-        # Build a synthetic "features" snapshot at interval end. We pull from
-        # the engine's current state, which represents the last frame seen.
-        # NB: for a real interval-end frame we want the values *at end_ts*, not
-        # "now". The state machine has already moved on, so we approximate
-        # using the last computed values held by self.state.
-        synthetic = self._synthetic_features_at(end_ts, state_name)
+        avg_speed_mph = speed_sum_mph / sample_count if sample_count > 0 else 0.0
+        base_detail = f"duration={duration:.0f}s, avg_speed={avg_speed_mph:.1f} mph"
+
+        # Snapshot features at the last in-state row. The engine has already
+        # advanced past it (we're being called on the transition frame), but
+        # st.prev_* still holds last-in-state values because the per-frame
+        # delta update in process_frame happens AFTER the state machine call
+        # path -- the prev_* fields hold the values from the row that triggered
+        # the transition, which is the first OUT-of-state row. NB: this means
+        # lat/lon/confidence in the emitted event reflect the first-out-of-state
+        # row, not the last-in-state row. The analyzer uses seg.iloc[-1] which
+        # is the last-in-state row. This residual delta is one sample of
+        # lat/lon drift; for stationary STOPPED intervals it is zero, and for
+        # moving intervals it is ~speed * 1s. Acceptable for v0.1; revisit
+        # if a future RULES_VERSION bump touches interval emission.
+        snapshot = self._snapshot_features_at(last_in_state_ts, state_name)
 
         # Trip start: first sustained MOVING/HIGHWAY/LOW_SPEED interval.
         if state_name in ("MOVING", "HIGHWAY", "LOW_SPEED"):
             if (not self._trip.trip_active) and duration >= cfg.trip_start_min_duration_s:
                 self._emit_event(
-                    feats=synthetic,
+                    feats=snapshot,
                     event_type="trip_start",
                     score=0.70,
-                    detail=f"duration={duration:.0f}s",
+                    detail=base_detail,
                 )
                 self._trip.trip_active = True
 
             # Once per trip: state_highway / state_moving summary
             if state_name == "HIGHWAY" and "HIGHWAY" not in self._trip.emitted_states:
-                self._emit_event(synthetic, "state_highway", 0.40, f"duration={duration:.0f}s")
+                self._emit_event(snapshot, "state_highway", 0.40, base_detail)
                 self._trip.emitted_states.add("HIGHWAY")
             elif state_name == "MOVING" and "MOVING" not in self._trip.emitted_states:
-                self._emit_event(synthetic, "state_moving", 0.35, f"duration={duration:.0f}s")
+                self._emit_event(snapshot, "state_moving", 0.35, base_detail)
                 self._trip.emitted_states.add("MOVING")
 
         elif state_name == "STOPPED":
             # state_stopped only for real stops (not stoplights).
             if duration >= cfg.state_stopped_min_duration_s:
-                self._emit_event(synthetic, "state_stopped", 0.20, f"duration={duration:.0f}s")
+                self._emit_event(snapshot, "state_stopped", 0.20, base_detail)
 
             # long_stop or trip_pause_or_parked.
             if self._trip.trip_active and duration >= cfg.trip_end_min_stopped_s:
-                self._emit_event(synthetic, "trip_pause_or_parked", 0.65,
-                                 f"duration={duration:.0f}s, very long stopped interval")
+                self._emit_event(
+                    snapshot, "trip_pause_or_parked", 0.65,
+                    f"{base_detail}, very long stopped interval",
+                )
                 # Reset per-trip flags so the next drive emits fresh state summaries.
                 self._trip.emitted_states.clear()
                 # trip_active stays True -- same session.
 
             elif self._trip.trip_active and duration >= cfg.long_stop_min_duration_s:
-                self._emit_event(synthetic, "long_stop", 0.45,
-                                 f"duration={duration:.0f}s, stopped within active session")
+                self._emit_event(
+                    snapshot, "long_stop", 0.45,
+                    f"{base_detail}, stopped within active session",
+                )
 
         elif state_name == "GPS_DEGRADED":
             if not self._trip.in_gps_degraded_episode:
-                self._emit_event(synthetic, "state_gps_degraded", 0.50, f"duration={duration:.0f}s")
+                self._emit_event(snapshot, "state_gps_degraded", 0.50, base_detail)
                 self._trip.in_gps_degraded_episode = True
 
         elif state_name == "GPS_UNTRUSTED":
             if not self._trip.in_gps_untrusted_episode:
-                self._emit_event(synthetic, "state_gps_untrusted", 0.65, f"duration={duration:.0f}s")
+                self._emit_event(snapshot, "state_gps_untrusted", 0.65, base_detail)
                 self._trip.in_gps_untrusted_episode = True
 
         # When we leave a GPS-degraded/untrusted state, reset the episode flag.
@@ -338,14 +383,18 @@ class StreamingEngine:
             self._trip.in_gps_degraded_episode = False
             self._trip.in_gps_untrusted_episode = False
 
-    def _synthetic_features_at(self, ts: float, state_name: str) -> ComputedFeatures:
+    def _snapshot_features_at(self, ts: float, state_name: str) -> ComputedFeatures:
         """Build a feature snapshot for interval-end events.
 
-        We don't have the exact frame at end_ts (the engine has already moved
-        past it). For interval summaries this is acceptable: the values that
-        matter for packet encoding (lat/lon at event time, speed, confidence)
-        come from the most recently seen frame, which is what the analyzer
-        also does -- it uses the seg.iloc[-1] row.
+        Stamped on the supplied ts (which the caller sets to the last in-state
+        row's timestamp, matching the analyzer's seg.iloc[-1] convention).
+
+        The lat/lon/speed/confidence values come from self.state.prev_*, which
+        currently hold the FIRST out-of-state row's values (one sample after
+        last_in_state). See the note in _maybe_emit_state_interval. This is
+        accepted v0.1 residual; the timestamp and detail string are correct
+        to the sample, which is what matters for analyzer parity on
+        elapsed_s, duration, and avg_speed.
         """
         st = self.state
         return ComputedFeatures(

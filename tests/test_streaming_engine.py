@@ -13,7 +13,9 @@ from __future__ import annotations
 
 from skybounce_app_logistics.csv_source import SensorFrame, _safe_float
 from skybounce_app_logistics.engine import StreamingEngine
-from skybounce_app_logistics.state import StreamingState, process_frame
+from skybounce_app_logistics.state import (
+    StreamingState, process_frame, update_state_window,
+)
 from skybounce_app_logistics.transport import Event, FileTransport
 from skybounce_event_rules import AnalyzerConfig
 
@@ -223,3 +225,288 @@ class TestFileTransport:
         d = json.loads(line)
         assert d["event_type"] == "x"
         assert d["priority"] == "P1"
+
+"""
+Additions to test_streaming_engine.py for the v0.1.1 state-window fix.
+
+Apply by:
+1) Adding `update_state_window` to the import line near the top of
+   test_streaming_engine.py:
+
+       from skybounce_app_logistics.state import (
+           StreamingState, process_frame, update_state_window,
+       )
+
+2) Appending the two new test classes below to the end of the file.
+
+The first class (TestStateWindow) tests the new state.py helper in
+isolation -- snapshot semantics, accumulation, reset on transition.
+
+The second class (TestStateIntervalEmission) tests the end-to-end
+detail-string format and timestamp convention through the engine,
+locking the contract with the PC analyzer's add_interval_event:
+   - event stamped on the LAST in-state row
+   - duration = ts(last in-state) - ts(first in-state)
+   - detail = f"duration={d:.0f}s, avg_speed={s:.1f} mph"
+"""
+
+
+# =============================================================================
+# State-window helper (snapshot semantics)
+# =============================================================================
+
+class TestStateWindow:
+    """Unit tests for update_state_window in state.py.
+
+    Exercises the helper directly without going through the engine, so the
+    contract -- snapshot tuple shape, accumulation math, reset on transition --
+    is locked independent of any downstream behavior.
+    """
+
+    def setup_method(self):
+        self.cfg = AnalyzerConfig()
+        self.state = StreamingState(cfg=self.cfg)
+
+    def test_first_transition_initializes_window(self):
+        """The very first call with transitioned=True establishes the window.
+
+        Before any call the window fields are at their defaults
+        (start_ts=None, last_ts=None, sum=0.0, count=0). The returned snapshot
+        falls back to (ts, ts, 0.0, 0) for the (empty) prior window, then the
+        helper resets to start a fresh window on the current frame.
+        """
+        ts = 1000.0
+        speed_m_s = 5.0
+
+        snapshot = update_state_window(
+            self.state, ts_epoch_s=ts, speed_m_s=speed_m_s, transitioned=True,
+        )
+
+        start_ts, last_in_state_ts, speed_sum_mph, sample_count = snapshot
+        # Empty prior window: snapshot falls back to current ts on both ends.
+        assert start_ts == ts
+        assert last_in_state_ts == ts
+        assert speed_sum_mph == 0.0
+        assert sample_count == 0
+
+        # Window has been reset to start on this frame.
+        assert self.state.state_window_start_ts == ts
+        assert self.state.state_window_last_ts == ts
+        assert self.state.state_window_speed_mph_sum == speed_m_s * 2.23694
+        assert self.state.state_window_sample_count == 1
+
+    def test_window_accumulates_within_state(self):
+        """Three same-state frames: start_ts pins to first, last_ts to most
+        recent, speed_sum and count grow."""
+        # Frame 1: transition (entering new state). Speed 10 m/s.
+        update_state_window(
+            self.state, ts_epoch_s=100.0, speed_m_s=10.0, transitioned=True,
+        )
+        # Frames 2 and 3: same state, accumulate. Speeds 20 and 30 m/s.
+        update_state_window(
+            self.state, ts_epoch_s=101.0, speed_m_s=20.0, transitioned=False,
+        )
+        update_state_window(
+            self.state, ts_epoch_s=102.0, speed_m_s=30.0, transitioned=False,
+        )
+
+        assert self.state.state_window_start_ts == 100.0
+        assert self.state.state_window_last_ts == 102.0
+        # Sum is (10 + 20 + 30) * 2.23694 mph.
+        expected_sum = (10.0 + 20.0 + 30.0) * 2.23694
+        assert abs(self.state.state_window_speed_mph_sum - expected_sum) < 1e-9
+        assert self.state.state_window_sample_count == 3
+
+    def test_snapshot_on_transition_returns_just_closed_window(self):
+        """After accumulating, a transition returns the closed window and
+        resets to start a new one on the transition frame."""
+        # Build a window of three frames in state A.
+        update_state_window(
+            self.state, ts_epoch_s=100.0, speed_m_s=10.0, transitioned=True,
+        )
+        update_state_window(
+            self.state, ts_epoch_s=101.0, speed_m_s=20.0, transitioned=False,
+        )
+        update_state_window(
+            self.state, ts_epoch_s=102.0, speed_m_s=30.0, transitioned=False,
+        )
+
+        # Frame 4: transition into state B. Speed 5 m/s.
+        snapshot = update_state_window(
+            self.state, ts_epoch_s=103.0, speed_m_s=5.0, transitioned=True,
+        )
+
+        # Snapshot is the just-closed (state A) window.
+        start_ts, last_in_state_ts, speed_sum_mph, sample_count = snapshot
+        assert start_ts == 100.0
+        assert last_in_state_ts == 102.0
+        expected_sum = (10.0 + 20.0 + 30.0) * 2.23694
+        assert abs(speed_sum_mph - expected_sum) < 1e-9
+        assert sample_count == 3
+
+        # Window has been reset onto the transition frame (state B start).
+        assert self.state.state_window_start_ts == 103.0
+        assert self.state.state_window_last_ts == 103.0
+        assert abs(
+            self.state.state_window_speed_mph_sum - 5.0 * 2.23694
+        ) < 1e-9
+        assert self.state.state_window_sample_count == 1
+
+    def test_non_transition_returns_none(self):
+        """A non-transition call returns None (no snapshot)."""
+        update_state_window(
+            self.state, ts_epoch_s=100.0, speed_m_s=10.0, transitioned=True,
+        )
+        result = update_state_window(
+            self.state, ts_epoch_s=101.0, speed_m_s=10.0, transitioned=False,
+        )
+        assert result is None
+
+
+# =============================================================================
+# State-interval emission (analyzer-parity detail strings and timestamps)
+# =============================================================================
+
+class TestStateIntervalEmission:
+    """Tests the state-interval emission path with analyzer-parity formatting.
+
+    Locks the contract with the PC analyzer's add_interval_event:
+      - event stamped on the LAST in-state row's ts_epoch_s
+      - duration_s = ts(last in-state) - ts(first in-state)
+      - detail format = f"duration={d:.0f}s, avg_speed={s:.1f} mph[, suffix]"
+
+    These tests drive _maybe_emit_state_interval directly with pre-computed
+    window values rather than running a full stream through the dwell-time
+    state machine. This isolates the formatting contract from rules-library
+    debounce behavior (which has its own tests in skybounce-event-rules).
+
+    Future drift in any of these (renaming a field, changing the format
+    string, off-by-one in the boundary row) breaks these tests.
+    """
+
+    def setup_method(self):
+        self.cfg = AnalyzerConfig()
+
+    def _make_engine(self, tmp_path):
+        out_path = tmp_path / "events.jsonl"
+        transport = FileTransport(out_path)
+        engine = StreamingEngine(transport=transport, cfg=self.cfg)
+        # Prime st.prev_* so _snapshot_features_at returns sensible values.
+        # The snapshot needs prev_speed_m_s, prev_gps_lat/lon, and
+        # gps_confidence_smoothed populated. We set them directly rather
+        # than running frames through process_frame.
+        engine.state.session_start_ts = 1000.0
+        engine.state.prev_ts_epoch_s = 1299.0
+        engine.state.prev_speed_m_s = 0.0
+        engine.state.prev_gps_lat = 40.44
+        engine.state.prev_gps_lon = -79.99
+        engine.state.gps_confidence_smoothed = 0.9
+        engine.state.anchor_lat = 40.44
+        engine.state.anchor_lon = -79.99
+        return engine, out_path
+
+    def _read_events(self, out_path):
+        import json
+        return [json.loads(line) for line in out_path.read_text().splitlines()]
+
+    def test_state_stopped_detail_format_locks_analyzer_contract(self, tmp_path):
+        """STOPPED window of 100 stationary samples spanning [1200.0 .. 1299.0]
+        produces 'duration=99s, avg_speed=0.0 mph' stamped on ts=1299.0.
+
+        This is the analyzer-parity contract: last in-state row, duration
+        as the difference between last and first in-state timestamps,
+        avg_speed as the mean of speed_mph over the window.
+        """
+        engine, out_path = self._make_engine(tmp_path)
+
+        # Engine needs trip_active=False for state_stopped (no long_stop).
+        # Drive _maybe_emit_state_interval directly with a known window.
+        engine._maybe_emit_state_interval(
+            state_name="STOPPED",
+            start_ts=1200.0,
+            last_in_state_ts=1299.0,
+            speed_sum_mph=0.0,        # 100 samples * 0.0 m/s
+            sample_count=100,
+        )
+
+        events = self._read_events(out_path)
+        state_stopped = [e for e in events if e["event_type"] == "state_stopped"]
+        assert len(state_stopped) == 1, (
+            f"expected 1 state_stopped, got events {[e['event_type'] for e in events]}"
+        )
+
+        ev = state_stopped[0]
+        # Detail-string format locked to analyzer's add_interval_event.
+        # Update both sides together or not at all.
+        assert ev["detail"] == "duration=99s, avg_speed=0.0 mph", (
+            f"detail string drift; got {ev['detail']!r}"
+        )
+        # Stamped on the LAST in-state row, not the first out-of-state row.
+        assert ev["ts_epoch_s"] == 1299.0
+
+    def test_state_stopped_avg_speed_is_mean_of_window_samples(self, tmp_path):
+        """A window with non-zero speeds produces avg_speed = sum_mph / count.
+
+        Build a window with sum_mph = 5.0 * 2.23694 * 100 = 1118.47 mph-samples
+        across 100 samples, i.e. each sample contributing 5.0 m/s -> 11.18 mph.
+        Expected avg_speed = 11.2 mph (after :.1f formatting).
+        """
+        engine, out_path = self._make_engine(tmp_path)
+        sum_mph = 5.0 * 2.23694 * 100   # 1118.47
+
+        engine._maybe_emit_state_interval(
+            state_name="STOPPED",
+            start_ts=1200.0,
+            last_in_state_ts=1299.0,
+            speed_sum_mph=sum_mph,
+            sample_count=100,
+        )
+
+        events = self._read_events(out_path)
+        state_stopped = [e for e in events if e["event_type"] == "state_stopped"]
+        assert len(state_stopped) == 1
+        # avg = 1118.47 / 100 = 11.1847 -> ":.1f" -> "11.2"
+        assert state_stopped[0]["detail"] == "duration=99s, avg_speed=11.2 mph"
+
+    def test_long_stop_appends_suffix_to_base_detail(self, tmp_path):
+        """long_stop = state_stopped detail + ', stopped within active session'.
+
+        Requires trip_active. The 120s window is above long_stop_min_duration_s
+        (90s default) so long_stop fires alongside state_stopped.
+        """
+        engine, out_path = self._make_engine(tmp_path)
+        engine._trip.trip_active = True   # required for long_stop emit
+
+        engine._maybe_emit_state_interval(
+            state_name="STOPPED",
+            start_ts=1200.0,
+            last_in_state_ts=1319.0,   # 119s duration
+            speed_sum_mph=0.0,
+            sample_count=120,
+        )
+
+        events = self._read_events(out_path)
+        long_stop = [e for e in events if e["event_type"] == "long_stop"]
+        assert len(long_stop) == 1, (
+            f"expected 1 long_stop, got events {[e['event_type'] for e in events]}"
+        )
+        assert long_stop[0]["detail"] == (
+            "duration=119s, avg_speed=0.0 mph, stopped within active session"
+        )
+        assert long_stop[0]["ts_epoch_s"] == 1319.0
+
+    def test_below_min_duration_emits_nothing(self, tmp_path):
+        """A window shorter than min_state_duration_s (30s default) emits
+        no event, even though the format would otherwise be valid."""
+        engine, out_path = self._make_engine(tmp_path)
+
+        engine._maybe_emit_state_interval(
+            state_name="STOPPED",
+            start_ts=1200.0,
+            last_in_state_ts=1210.0,   # 10s, below min_state_duration_s
+            speed_sum_mph=0.0,
+            sample_count=11,
+        )
+
+        events = self._read_events(out_path)
+        assert events == []

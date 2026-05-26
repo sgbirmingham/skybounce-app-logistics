@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "skybounce-app-logistics"
-version = "0.1.0"
+version = "0.1.1"
 description = "SkyBounce streaming event engine for logistics / vehicle telemetry"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -36,6 +36,7 @@ validation = [
 
 [project.scripts]
 sb-logistics-replay = "skybounce_app_logistics.scripts.replay:main"
+sb-logistics-live = "skybounce_app_logistics.scripts.live:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
