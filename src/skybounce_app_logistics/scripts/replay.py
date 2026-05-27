@@ -18,7 +18,7 @@ Two transport modes:
     --transport ipc
         Encode each event as SB45 and submit via IpcTransport. Requires
         a running SkyBounce daemon on the configured Unix socket and
-        skybounce_IPC_python on PYTHONPATH. --out is ignored.
+        skybounce-ipc-python on PYTHONPATH. --out is ignored.
 
 Usage:
     sb-logistics-replay --input drive.csv --out events.jsonl
@@ -92,7 +92,7 @@ def main() -> None:
                 socket_path=args.socket,
             )
         except ImportError as e:
-            parser.error(f"--transport ipc requires skybounce_IPC_python: {e}")
+            parser.error(f"--transport ipc requires skybounce-ipc-python: {e}")
             return  # unreachable; parser.error exits
         out_descr = f"IPC endpoint_id=0x{args.endpoint_id:08X}"
 

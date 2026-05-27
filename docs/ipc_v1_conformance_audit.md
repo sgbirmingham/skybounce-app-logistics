@@ -2,7 +2,7 @@
 
 Audit target: `skybounce-app-logistics` (this repo).
 Reference: SkyBounce Sensor IPC Protocol v1.0 + companion artifacts in
-`../skybounce_IPC_python/{docs,scripts}/`.
+`../skybounce-ipc-python/{docs,scripts}/`.
 Read-only audit; no code modified. Audit date: 2026-05-26.
 
 ## Scope note: the ownership boundary
@@ -30,7 +30,7 @@ well-formed.
   is the default. `IpcTransport` is dead code until a caller is added.
 - **Reference-stub ambiguity (flag, do not resolve):** `sensor_app_stub.py`
   imports `skybounce.sensor_ipc.endpoint`, `.transport`, `.wire`. Those
-  module paths do not exist in `../skybounce_IPC_python/` on disk; the
+  module paths do not exist in `../skybounce-ipc-python/` on disk; the
   repo has flat `skybounce_ipc.py` / `skybounce_client.py`. The stub
   appears to target a future package layout. The state-machine comparison
   in Section 2 is therefore based on the stub's documented intent and
@@ -84,14 +84,14 @@ every CMD is rejected with `ERR_UNKNOWN_CODE`.
 
 ## Section 2 — State-machine comparison vs `sensor_app_stub.py`
 
-The stub (`../skybounce_IPC_python/scripts/sensor_app_stub.py`) is the
+The stub (`../skybounce-ipc-python/scripts/sensor_app_stub.py`) is the
 minimal sensor-side reference. Both it and this repo are sensor-side
 peers — they connect to a SkyBounce process and run identical state
 machines. The comparison below maps each stub behavior to the
 audit-target's equivalent.
 
 **Caveat:** the stub imports from a `skybounce.sensor_ipc.*` package
-that does not exist on disk in `../skybounce_IPC_python/`. The
+that does not exist on disk in `../skybounce-ipc-python/`. The
 comparison treats the stub as a behavioral spec, not as code I have
 verified runs against the present IPC reference.
 
@@ -233,7 +233,7 @@ items are prerequisites for later ones.
 
 8. **Loopback test with `IpcTransport`.** Once items 1–6 are in,
    exercise `IpcTransport` against the IPC repo's loopback test
-   (`../skybounce_IPC_python/tests/test_loopback.py`) or an equivalent
+   (`../skybounce-ipc-python/tests/test_loopback.py`) or an equivalent
    in-process mock listener. Confirm: HELLO/HELLO_ACK completes, at
    least one TELEMETRY round-trips with a non-failure ACK disposition,
    one CMD round-trips with `OK`, one PING/PONG exchange completes.
@@ -263,14 +263,14 @@ items are prerequisites for later ones.
 
 ## Appendix: artifacts read
 
-- `../skybounce_IPC_python/docs/sensor_ipc_README.md`
-- `../skybounce_IPC_python/docs/sensor_ipc_goldens.json` (15 entries)
-- `../skybounce_IPC_python/docs/sb45_payload_companion_doc.md`
-- `../skybounce_IPC_python/docs/sensor_ipc_HANDOFF.md`
-- `../skybounce_IPC_python/scripts/sensor_app_stub.py`
-- `../skybounce_IPC_python/skybounce_ipc.py`
-- `../skybounce_IPC_python/skybounce_client.py`
-- `../skybounce_IPC_python/sb_telemetry_payload.py`
+- `../skybounce-ipc-python/docs/sensor_ipc_README.md`
+- `../skybounce-ipc-python/docs/sensor_ipc_goldens.json` (15 entries)
+- `../skybounce-ipc-python/docs/sb45_payload_companion_doc.md`
+- `../skybounce-ipc-python/docs/sensor_ipc_HANDOFF.md`
+- `../skybounce-ipc-python/scripts/sensor_app_stub.py`
+- `../skybounce-ipc-python/skybounce_ipc.py`
+- `../skybounce-ipc-python/skybounce_client.py`
+- `../skybounce-ipc-python/sb_telemetry_payload.py`
 - `src/skybounce_app_logistics/transport.py`
 - `src/skybounce_app_logistics/engine.py`
 - `src/skybounce_app_logistics/state.py`

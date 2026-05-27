@@ -12,7 +12,7 @@ the SkyBounce IPC socket (for real radio transmission).
 
 Layering:
 - skybounce_event_rules        rule primitives, thresholds, detectors
-- skybounce_IPC_python          protocol codec, IPC client (optional)
+- skybounce-ipc-python          protocol codec, IPC client (optional)
 - skybounce_app_logistics       this package: orchestrates the above
 
 The streaming engine is event-by-event equivalent to the PC analyzer's

@@ -9,7 +9,7 @@ Transports for streaming events. Two implementations:
 
 - IpcTransport: encodes events using SB45_SIM_V0 and submits them via the
   SkyBounce IPC client. Used on the Pi for real radio operation. Imports
-  from skybounce_IPC_python at construction time, so this file is safe to
+  from skybounce-ipc-python at construction time, so this file is safe to
   import even when the IPC stack isn't installed.
 
 Both implement the same Transport protocol: emit(event) and close().
@@ -152,7 +152,7 @@ class IpcTransport:
             from sb_telemetry_payload import SB45Event, pack_sb45
         except ImportError as e:
             raise ImportError(
-                "IPC transport requires skybounce_IPC_python on PYTHONPATH. "
+                "IPC transport requires skybounce-ipc-python on PYTHONPATH. "
                 f"Original error: {e}"
             ) from e
 

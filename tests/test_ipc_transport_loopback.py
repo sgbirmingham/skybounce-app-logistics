@@ -30,9 +30,9 @@ This test is integration-only and is skipped when:
   - The platform lacks AF_UNIX (some Windows Python builds, embedded
     distributions). The SkyBounce IPC stack is AF_UNIX-only, so a
     workstation without it cannot run the test in any form.
-  - The skybounce_IPC_python package is not installed in the active
+  - The skybounce-ipc-python package is not installed in the active
     venv. To enable, run:
-        pip install -e ../skybounce_IPC_python
+        pip install -e ../skybounce-ipc-python
 
 On a Pi, Linux, or Mac with the IPC repo installed editable, this runs
 as a normal pytest test (a few hundred milliseconds end to end).
@@ -99,7 +99,7 @@ class MockSkyBounce:
     """Minimal in-process SkyBounce-side peer for one client connection.
 
     Trimmed from the canonical MockSkyBounce in
-    ../skybounce_IPC_python/tests/test_loopback.py; adds inject_cmd /
+    ../skybounce-ipc-python/tests/test_loopback.py; adds inject_cmd /
     inject_status APIs for driving the receive-side handlers under test.
     """
 
