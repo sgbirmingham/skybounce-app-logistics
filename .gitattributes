@@ -1,0 +1,9 @@
+# Default: let git auto-detect text vs binary, normalize line endings to LF
+# in the repo, and check out with LF on all platforms.
+#
+# This prevents the "phantom diff" problem where opening a file in a Windows
+# editor (or PowerShell tools that default to UTF-16 LE w/ BOM) flips every
+# line's ending and git shows every file as modified.
+#
+# If individual file types ever need explicit handling, add them below.
+* text=auto eol=lf
