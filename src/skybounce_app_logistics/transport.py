@@ -7,7 +7,7 @@ Transports for streaming events. Two implementations:
   line. Used for offline replay validation and during development. No IPC
   dependency.
 
-- IpcTransport: encodes events using SB45_SIM_V1 and submits them via the
+- IpcTransport: encodes events using SB45_SIM_V2 and submits them via the
   SkyBounce IPC client. Used on the Pi for real radio operation. Imports
   from skybounce-ipc-python at construction time, so this file is safe to
   import even when the IPC stack isn't installed.
@@ -110,7 +110,7 @@ class FileTransport:
 # -----------------------------------------------------------------------------
 
 class IpcTransport:
-    """Encode events using SB45_SIM_V1 and submit to the SkyBounce IPC client.
+    """Encode events using SB45_SIM_V2 and submit to the SkyBounce IPC client.
 
     Imports from skybounce_ipc and sb_telemetry_payload happen at construction
     time so this module can still be imported (and FileTransport used) when
