@@ -104,26 +104,31 @@ Expected: **32 passed**.
 
 ## 4. Run the streaming engine, file transport (dev / no radio)
 
-If you've also got `pi_sensor_stack` deployed and the logger running,
-this tails its CSV and writes events to JSONL.
+The logger runs as a systemd service (`vehicle-logger.service`), so you
+do NOT start it manually. The service writes CSVs to
+`/home/sgbir/sensor_data/vehicle_behavior/raw/` continuously.
 
 ```bash
-# Terminal 1: the logger (from pi_sensor_stack)
-cd ~/pi_sensor_stack/runtime/vehicle_behavior/logger
-python3 vehicle_behavior_simple_logger_v0_1.py \
-    --interval-s 1.0 \
-    --out-dir /home/sgbir/coldchain_poc/data/simple_logger/raw &
+# Terminal 1: verify the logger service is running and producing fresh CSVs
+systemctl is-active vehicle-logger.service
+ls -lt /home/sgbir/sensor_data/vehicle_behavior/raw/ | head -3
 
 # Terminal 2: the streaming engine, file transport (no IPC daemon needed)
+cd ~/skybounce/skybounce-app-logistics
 PYTHONPATH=/home/sgbir/skybounce/skybounce-ipc-python \
     ~/skybounce/venv/bin/python -m skybounce_app_logistics.scripts.live \
-        --watch /home/sgbir/coldchain_poc/data/simple_logger/raw \
-        --out   /home/sgbir/coldchain_poc/data/events/live.jsonl
+        --watch /home/sgbir/sensor_data/vehicle_behavior/raw \
+        --out   /home/sgbir/sensor_data/vehicle_behavior/events/live.jsonl
 ```
 
 Events flow into `live.jsonl`. Tail it with `tail -f` to watch them
 appear. Ctrl+C the engine for clean shutdown (it flushes any pending
 interval events first).
+
+Note: when the Pi is stationary (e.g., sitting on a desk indoors with no
+GPS fix), the engine correctly stays in `STARTUP_GPS_ACQUIRING` state
+and emits very few events. For a demo-grade event stream, use replay
+against a validated drive CSV — see section 6.
 
 ## 5. Run the streaming engine, IPC transport (real)
 
@@ -136,9 +141,10 @@ PYTHONPATH=/home/sgbir/skybounce/skybounce-ipc-python \
     ~/skybounce/venv/bin/python /home/sgbir/skybounce/skybounce-ipc-python/examples/mock_skybounce_listener.py &
 
 # The streaming engine, IPC transport
+cd ~/skybounce/skybounce-app-logistics
 PYTHONPATH=/home/sgbir/skybounce/skybounce-ipc-python \
     ~/skybounce/venv/bin/python -m skybounce_app_logistics.scripts.live \
-        --watch /home/sgbir/coldchain_poc/data/simple_logger/raw \
+        --watch /home/sgbir/sensor_data/vehicle_behavior/raw \
         --transport ipc \
         --socket /tmp/skybounce-sensor.sock \
         --endpoint-id 0x53415050
@@ -149,16 +155,38 @@ that fact). Events are encoded as 6-byte SB45 payloads and submitted
 via the IPC client. Watch the mock listener's output to see what
 arrived.
 
-For replay against a stored CSV (offline validation, no logger needed):
+## 6. Replay against a validated drive CSV (demo path)
+
+This is the most demonstrable use of the streaming engine: a real
+validated drive CSV in, event JSONL out, in under a second. Three drives
+are validated and known to produce byte-exact analyzer parity:
 
 ```bash
+cd ~/skybounce/skybounce-app-logistics
 PYTHONPATH=/home/sgbir/skybounce/skybounce-ipc-python \
     ~/skybounce/venv/bin/python -m skybounce_app_logistics.scripts.replay \
-        --input /path/to/drive.csv \
-        --out   /tmp/events.jsonl
+        --input /home/sgbir/sensor_data/vehicle_behavior/raw/vehicle_behavior_simple_logger_v0_1_2026-05-26_06-38-45.csv \
+        --out   /home/sgbir/sensor_data/vehicle_behavior/events/replay_may26.jsonl
 ```
 
-## 6. Troubleshooting
+Expected: ~22 events emitted (14 analyzer-parity events + state-interval
+heartbeats + 1 startup event).
+
+To inspect:
+
+```bash
+wc -l /home/sgbir/sensor_data/vehicle_behavior/events/replay_may26.jsonl
+grep -v "startup_gps_acquiring" /home/sgbir/sensor_data/vehicle_behavior/events/replay_may26.jsonl \
+    | python3 -c "import sys,json; [print(json.loads(l).get('event_type','?'), '/', json.loads(l).get('priority','?')) for l in sys.stdin]"
+```
+
+Validated drives:
+
+- `vehicle_behavior_simple_logger_v0_1_2026-05-18_16-15-23.csv` (47 min, 12 hard events)
+- `vehicle_behavior_simple_logger_v0_1_2026-05-19_12-52-09.csv` (70 min, 21 hard events)
+- `vehicle_behavior_simple_logger_v0_1_2026-05-26_06-38-45.csv` (48 min, 14 hard events)
+
+## 7. Troubleshooting
 
 **`ModuleNotFoundError: No module named 'skybounce_client'`**
 PYTHONPATH not set. The IPC repo has flat modules and isn't
@@ -184,20 +212,29 @@ and the engine is producing fast, telemetry submissions will raise
 `queue.Full`. Look in `transport.py`'s TELEMETRY_ACK summary at
 shutdown to see what dispositions came back.
 
-## 7. What's NOT covered here
+**No events appearing in live mode**
+The engine is conservative on startup. When the Pi is stationary and
+GPS hasn't acquired a fix, the engine sits in `STARTUP_GPS_ACQUIRING`
+and emits only the initial context event. Shake hard or wait for GPS;
+better, use the replay path in section 6.
 
-- **systemd units** for keeping the logger / engine alive across reboots.
-  Out of scope for v0.1; ask for a follow-up if needed.
+**Pytest run from `~` finds unrelated tests**
+Don't run pytest from your home directory — it walks the whole tree
+and tries to import every `test_*.py` and `*_test.py` file, including
+old HackRF, ads1256, and coldchain_poc code that has unrelated
+dependencies. Always `cd` into the specific repo first.
+
+## 8. What's NOT covered here
+
+- **systemd unit for the streaming engine.** The logger has a service
+  (`vehicle-logger.service`) but the streaming engine still runs in the
+  foreground. Ask for a follow-up if needed.
 - **Real SkyBounce daemon** install / config. This sheet assumes either
   the mock listener or that a SkyBounce daemon is already running.
 - **Sensor wiring** (BME280, DS18B20, GPS, MPU6050). That's
-  `pi_sensor_stack` territory; existing scripts handle it.
-- **Logger deployment**. The vehicle_behavior logger lives in
-  `pi_sensor_stack` and follows its own deploy script
-  (`runtime/vehicle_behavior/deploy_to_runtime.sh` — not read by me;
-  may or may not be current).
+  `pi-sensor-stack` territory; existing scripts handle it.
 
-## 8. Quick reference: paths to remember
+## 9. Quick reference: paths to remember
 
 ```
 /home/sgbir/skybounce/                          deploy root
@@ -206,9 +243,16 @@ shutdown to see what dispositions came back.
     skybounce-event-rules/                      shared rules (pip -e)
     skybounce-app-logistics/                    streaming engine (pip -e)
 
-/home/sgbir/coldchain_poc/data/                 sensor data, by convention
-    simple_logger/raw/                          logger CSV output
+/home/sgbir/repos/pi-sensor-stack/              vehicle-behavior logger (canonical)
+    runtime/vehicle_behavior/logger/            logger script (runs as service)
+
+/home/sgbir/sensor_data/vehicle_behavior/       sensor data, neutral location
+    raw/                                        logger CSV output
+        archive_v1.1/                           older v1.1 logger CSVs (April)
+        archive_v7_4/                           older v7_4 logger CSVs (April)
     events/                                     streaming engine JSONL output
+
+/etc/systemd/system/vehicle-logger.service      logger systemd unit
 
 /tmp/skybounce-sensor.sock                      default IPC socket
 ```
