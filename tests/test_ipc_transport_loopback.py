@@ -396,3 +396,36 @@ def test_status_link_state_transitions_surface(loopback):
     assert _wait_until(
         lambda: transport._last_link_state == int(LinkState.UP), timeout_s=2.0
     ), f"UP not observed; _last_link_state={transport._last_link_state}"
+
+
+def test_close_drains_pending_telemetry(loopback):
+    """Burst-submit N events and immediately close the transport. Without
+    the drain in close(), only a fraction of frames reach the wire because
+    SkyBounceClient.stop() closes the socket before the writer queue is
+    flushed. This is exactly the pattern replay scripts hit.
+
+    Regression test for the close-race observed during 2026-05-27 Pi
+    validation, where a 4-event burst landed only 1 frame on the mock
+    side. With the drain, all N must arrive before close() returns.
+    """
+    transport, mock = loopback
+    N = 5
+
+    for _ in range(N):
+        transport.emit(_make_event())
+
+    # Close should block until every submission has a terminal disposition
+    # (or the drain timeout fires). The fixture mock ACKs with DELIVERED on
+    # a ~20ms cadence, so total drain wait should be well under a second.
+    transport.close()
+
+    assert len(mock.received_telemetry) == N, (
+        f"expected {N} TELEMETRY frames on mock side after close; got "
+        f"{len(mock.received_telemetry)} "
+        f"(ids={[t.telemetry_id for t in mock.received_telemetry]})"
+    )
+    delivered = int(Disposition.DELIVERED)
+    assert transport.ack_counts.get(delivered, 0) == N, (
+        f"expected {N} DELIVERED ACKs accounted for in transport; "
+        f"got ack_counts={transport.ack_counts}"
+    )
