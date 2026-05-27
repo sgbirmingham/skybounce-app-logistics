@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional, Protocol
@@ -131,6 +132,16 @@ class IpcTransport:
         "LOG": "NORMAL",
     }
 
+    # Default close() drain budget. Long enough to absorb a burst-submit
+    # finishing the writer queue plus the daemon's QUEUED -> DELIVERED hop;
+    # short enough that a stuck daemon doesn't hang process shutdown.
+    _DEFAULT_CLOSE_DRAIN_TIMEOUT_S = 5.0
+
+    # Poll cadence while waiting for terminal dispositions. 20 ms keeps
+    # the wait responsive without busy-looping; ACKs only flow during
+    # daemon round-trips so finer granularity buys nothing.
+    _DRAIN_POLL_INTERVAL_S = 0.02
+
     def __init__(self, endpoint_id: int, socket_path: Optional[str] = None) -> None:
         # Defer imports until construction so module imports cleanly without IPC.
         try:
@@ -159,6 +170,11 @@ class IpcTransport:
         self._cmds_received = 0
         self._ack_counts: dict[int, int] = {}
         self._last_link_state: Optional[int] = None
+
+        # Guard against double-close (drain timeout makes calling close()
+        # twice expensive otherwise, and SkyBounceClient.stop() is not
+        # documented as idempotent).
+        self._closed = False
 
         self._client = SkyBounceClient(endpoint_id=endpoint_id, socket_path=socket_path)
 
@@ -286,7 +302,55 @@ class IpcTransport:
         self._client.submit_telemetry(packed.bytes_payload, priority=ipc_prio)
         self._count += 1
 
-    def close(self) -> None:
+    def close(self, drain_timeout_s: Optional[float] = None) -> None:
+        """Drain pending submissions (best-effort), log summary, stop client.
+
+        Before tearing down the IPC socket, wait up to drain_timeout_s for
+        every telemetry submitted via emit() to receive a terminal disposition
+        -- DELIVERED, or any failure code per spec Section 7.4 (high bit set).
+        SkyBounceClient.stop() closes the socket immediately and does not drain
+        its writer queue, so without this wait the replay-mode pattern of
+        "submit a burst, then immediately close" drops in-flight frames.
+
+        If the deadline passes with submissions still outstanding, logs a
+        WARNING with the outstanding count and proceeds to stop -- the daemon
+        will see the disconnect and stop ACKing, but at least the operator
+        knows how much was lost.
+
+        Idempotent: a second call is a no-op.
+        """
+        if self._closed:
+            return
+        self._closed = True
+
+        if drain_timeout_s is None:
+            drain_timeout_s = self._DEFAULT_CLOSE_DRAIN_TIMEOUT_S
+
+        if self._count > 0:
+            delivered = int(self._Disposition.DELIVERED)
+
+            def _terminal_count() -> int:
+                # DELIVERED is the only success disposition; failures all set
+                # the 0x80 bit per spec Section 7.4. Intermediate states like
+                # QUEUED and TRANSMITTED don't count -- they aren't terminal.
+                return sum(
+                    c for d, c in self._ack_counts.items()
+                    if d == delivered or (d & 0x80)
+                )
+
+            deadline = time.monotonic() + drain_timeout_s
+            while _terminal_count() < self._count and time.monotonic() < deadline:
+                time.sleep(self._DRAIN_POLL_INTERVAL_S)
+
+            outstanding = self._count - _terminal_count()
+            if outstanding > 0:
+                log.warning(
+                    "IPC transport close: drain deadline (%.1fs) reached with "
+                    "%d/%d telemetries terminal; %d in-flight frames will be "
+                    "dropped at socket close",
+                    drain_timeout_s, _terminal_count(), self._count, outstanding,
+                )
+
         log.info("IPC transport closing, %d events submitted", self._count)
         if self._ack_counts:
             summary = ", ".join(
