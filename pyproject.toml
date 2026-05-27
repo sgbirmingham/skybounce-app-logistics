@@ -15,7 +15,7 @@ authors = [
 
 # Runtime dependencies:
 # - skybounce-event-rules: shared rule library (this is the whole point)
-# - skybounce_IPC_python is required at runtime ONLY when --transport ipc is
+# - skybounce-ipc-python is required at runtime ONLY when --transport ipc is
 #   used. The file transport has no IPC dependency, which lets us run on
 #   workstations for replay validation without the protocol stack installed.
 # numpy is allowed for scalar math convenience but not for vectorization.

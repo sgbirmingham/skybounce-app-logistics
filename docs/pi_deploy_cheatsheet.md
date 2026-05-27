@@ -52,7 +52,7 @@ PI=pi-hostname     # or 192.168.x.x
 
 ssh sgbir@$PI 'mkdir -p /home/sgbir/skybounce'
 
-for repo in skybounce_IPC_python skybounce-event-rules skybounce-app-logistics; do
+for repo in skybounce-ipc-python skybounce-event-rules skybounce-app-logistics; do
     rsync -avz --exclude='.venv' --exclude='__pycache__' --exclude='.pytest_cache' \
         /mnt/c/Users/sgbir/Projects/$repo/ \
         sgbir@$PI:/home/sgbir/skybounce/$repo/
@@ -74,9 +74,9 @@ python3 -m venv venv
 ./venv/bin/python -m pip install -e ./skybounce-event-rules
 ./venv/bin/python -m pip install -e ./skybounce-app-logistics
 
-# skybounce_IPC_python has flat modules (no pyproject.toml) — use PYTHONPATH instead.
+# skybounce-ipc-python has flat modules (no pyproject.toml) — use PYTHONPATH instead.
 # Below commands all set PYTHONPATH inline. If you want it permanent:
-echo 'export PYTHONPATH=/home/sgbir/skybounce/skybounce_IPC_python' >> ~/.bashrc
+echo 'export PYTHONPATH=/home/sgbir/skybounce/skybounce-ipc-python' >> ~/.bashrc
 # then: source ~/.bashrc
 ```
 
@@ -84,7 +84,7 @@ echo 'export PYTHONPATH=/home/sgbir/skybounce/skybounce_IPC_python' >> ~/.bashrc
 
 ```bash
 cd /home/sgbir/skybounce/skybounce-app-logistics
-PYTHONPATH=/home/sgbir/skybounce/skybounce_IPC_python \
+PYTHONPATH=/home/sgbir/skybounce/skybounce-ipc-python \
     ~/skybounce/venv/bin/python -m pytest tests/test_ipc_transport_loopback.py -v
 ```
 
@@ -96,7 +96,7 @@ required for this test.
 Full test suite (29 streaming-engine tests + the 3 loopback):
 
 ```bash
-PYTHONPATH=/home/sgbir/skybounce/skybounce_IPC_python \
+PYTHONPATH=/home/sgbir/skybounce/skybounce-ipc-python \
     ~/skybounce/venv/bin/python -m pytest -v
 ```
 
@@ -115,7 +115,7 @@ python3 vehicle_behavior_simple_logger_v0_1.py \
     --out-dir /home/sgbir/coldchain_poc/data/simple_logger/raw &
 
 # Terminal 2: the streaming engine, file transport (no IPC daemon needed)
-PYTHONPATH=/home/sgbir/skybounce/skybounce_IPC_python \
+PYTHONPATH=/home/sgbir/skybounce/skybounce-ipc-python \
     ~/skybounce/venv/bin/python -m skybounce_app_logistics.scripts.live \
         --watch /home/sgbir/coldchain_poc/data/simple_logger/raw \
         --out   /home/sgbir/coldchain_poc/data/events/live.jsonl
@@ -132,11 +132,11 @@ listening on the configured socket.
 
 ```bash
 # Optional: mock listener for end-to-end test without real radio
-PYTHONPATH=/home/sgbir/skybounce/skybounce_IPC_python \
-    ~/skybounce/venv/bin/python /home/sgbir/skybounce/skybounce_IPC_python/examples/mock_skybounce_listener.py &
+PYTHONPATH=/home/sgbir/skybounce/skybounce-ipc-python \
+    ~/skybounce/venv/bin/python /home/sgbir/skybounce/skybounce-ipc-python/examples/mock_skybounce_listener.py &
 
 # The streaming engine, IPC transport
-PYTHONPATH=/home/sgbir/skybounce/skybounce_IPC_python \
+PYTHONPATH=/home/sgbir/skybounce/skybounce-ipc-python \
     ~/skybounce/venv/bin/python -m skybounce_app_logistics.scripts.live \
         --watch /home/sgbir/coldchain_poc/data/simple_logger/raw \
         --transport ipc \
@@ -152,7 +152,7 @@ arrived.
 For replay against a stored CSV (offline validation, no logger needed):
 
 ```bash
-PYTHONPATH=/home/sgbir/skybounce/skybounce_IPC_python \
+PYTHONPATH=/home/sgbir/skybounce/skybounce-ipc-python \
     ~/skybounce/venv/bin/python -m skybounce_app_logistics.scripts.replay \
         --input /path/to/drive.csv \
         --out   /tmp/events.jsonl
@@ -162,10 +162,10 @@ PYTHONPATH=/home/sgbir/skybounce/skybounce_IPC_python \
 
 **`ModuleNotFoundError: No module named 'skybounce_client'`**
 PYTHONPATH not set. The IPC repo has flat modules and isn't
-pip-installable; either export `PYTHONPATH=.../skybounce_IPC_python`
+pip-installable; either export `PYTHONPATH=.../skybounce-ipc-python`
 or prefix every command with it as shown above.
 
-**`--transport ipc requires skybounce_IPC_python: ...`**
+**`--transport ipc requires skybounce-ipc-python: ...`**
 Same as above — PYTHONPATH issue, surfaced as a clean argparse error.
 
 **Loopback test skipped on the Pi**
@@ -202,7 +202,7 @@ shutdown to see what dispositions came back.
 ```
 /home/sgbir/skybounce/                          deploy root
     venv/                                       Python venv
-    skybounce_IPC_python/                       IPC core (flat modules; PYTHONPATH)
+    skybounce-ipc-python/                       IPC core (flat modules; PYTHONPATH)
     skybounce-event-rules/                      shared rules (pip -e)
     skybounce-app-logistics/                    streaming engine (pip -e)
 

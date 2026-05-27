@@ -9,7 +9,7 @@ The first application in the SkyBounce app family. Detects vehicle-behavior even
 ```
 skybounce-app-logistics   ← this project (orchestrator)
 ├── skybounce_event_rules  (thresholds, detectors, policy)
-└── skybounce_IPC_python   (protocol codec + IPC client; optional)
+└── skybounce-ipc-python   (protocol codec + IPC client; optional)
 ```
 
 This project is the orchestrator. It owns the streaming loop, the CSV ingest, the per-row state machine, and the transport selection. It does not own threshold values or detector logic — those live in `skybounce_event_rules` so the PC analyzer (the oracle) and this streaming engine cannot drift.
@@ -24,7 +24,7 @@ pip install -e ".[dev]"
 
 You need `skybounce-event-rules` available on the Python path. For local development that's the editable install you already have.
 
-For the IPC transport (`--transport ipc`), you also need `skybounce_IPC_python` available. The file transport (`--transport file`, the default) has no IPC dependency.
+For the IPC transport (`--transport ipc`), you also need `skybounce-ipc-python` available. The file transport (`--transport file`, the default) has no IPC dependency.
 
 ## Validate against the PC analyzer (recommended first step)
 

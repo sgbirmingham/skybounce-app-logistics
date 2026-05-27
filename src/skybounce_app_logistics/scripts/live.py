@@ -158,7 +158,7 @@ def main() -> None:
                 socket_path=args.socket,
             )
         except ImportError as e:
-            parser.error(f"--transport ipc requires skybounce_IPC_python: {e}")
+            parser.error(f"--transport ipc requires skybounce-ipc-python: {e}")
             return  # unreachable; parser.error exits
         out_descr = f"IPC endpoint_id=0x{args.endpoint_id:08X}"
 
