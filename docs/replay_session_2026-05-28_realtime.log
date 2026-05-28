@@ -1,7 +1,7 @@
 ==============================================================================
 EVENT TIMELINE (annotation)
 ==============================================================================
-Source CSV (via replay_may26.jsonl): 22 events emitted by the streaming engine.
+Source: replay_may26.jsonl — 22 events emitted by the streaming engine.
 Times below are relative to the engine's session start (elapsed_s).
 Priority: LOG = local context / heartbeat; P1 = standard; P2 = safety-immediate.
 
