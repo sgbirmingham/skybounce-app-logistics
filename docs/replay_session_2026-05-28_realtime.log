@@ -1,3 +1,39 @@
+==============================================================================
+EVENT TIMELINE (annotation)
+==============================================================================
+Source CSV (via replay_may26.jsonl): 22 events emitted by the streaming engine.
+Times below are relative to the engine's session start (elapsed_s).
+Priority: LOG = local context / heartbeat; P1 = standard; P2 = safety-immediate.
+
+       t+  prio  event_type                    class               detail
+---------  ----  ----------------------------  ------------------  ----------------------------------------
+    0m00s  LOG   startup_gps_acquiring         LOCAL_CONTEXT       startup GPS not trusted
+    6m11s  P1    gps_degraded_persistent       GPS_HEALTH          duration=191s, avg_speed=0.0 mph
+    7m17s  P1    state_gps_untrusted           GPS_HEALTH          duration=247s, avg_speed=0.4 mph
+    8m40s  P1    hard_accel                    DRIVING_SUMMARY     accel=3.46 m/s^2
+    8m44s  P1    trip_start                    TRIP_SUMMARY        duration=60s, avg_speed=2.2 mph
+   17m46s  LOG   state_stopped                 LOCAL_CONTEXT       duration=511s, avg_speed=0.3 mph
+   17m46s  LOG   long_stop                     LOCAL_CONTEXT       duration=511s, avg_speed=0.3 mph, stopped within active session
+   20m24s  LOG   state_moving                  LOCAL_CONTEXT       duration=157s, avg_speed=9.9 mph
+   23m06s  P2    hard_brake                    SAFETY_IMMEDIATE    decel=3.41 m/s^2
+   25m00s  P1    moderate_impact               ROAD_EVENT          lin_accel=0.447 g, jerk=0.418 g/s, speed=35.5 mph
+   25m55s  P1    hard_brake                    SAFETY_CONTEXT      decel=28.64 m/s^2
+   25m56s  P2    hard_accel                    SAFETY_IMMEDIATE    accel=28.65 m/s^2
+   26m40s  P1    moderate_impact               ROAD_EVENT          lin_accel=0.332 g, jerk=0.490 g/s, speed=66.3 mph
+   28m48s  P1    moderate_impact               ROAD_EVENT          lin_accel=0.502 g, jerk=0.490 g/s, speed=70.9 mph
+   31m47s  P1    moderate_impact               ROAD_EVENT          lin_accel=0.345 g, jerk=0.336 g/s, speed=69.7 mph
+   35m27s  P1    moderate_impact               ROAD_EVENT          lin_accel=0.430 g, jerk=0.378 g/s, speed=68.3 mph
+   39m14s  P1    moderate_impact               ROAD_EVENT          lin_accel=0.308 g, jerk=0.409 g/s, speed=70.2 mph
+   41m22s  P1    state_highway                 TRIP_SUMMARY        duration=944s, avg_speed=66.8 mph
+   42m43s  P1    moderate_impact               ROAD_EVENT          lin_accel=0.363 g, jerk=0.368 g/s, speed=16.5 mph
+   44m32s  P1    moderate_impact               ROAD_EVENT          lin_accel=0.638 g, jerk=0.611 g/s, speed=24.9 mph
+   46m30s  P1    hard_brake                    SAFETY_CONTEXT      decel=3.09 m/s^2
+   47m52s  P1    state_gps_untrusted           GPS_HEALTH          duration=64s, avg_speed=0.0 mph
+
+==============================================================================
+RAW ENGINE LOG (stdout + stderr, captured verbatim during the run)
+==============================================================================
+
 2026-05-28 14:07:28,525 skybounce.client INFO starting SkyBounce client, socket=/tmp/skybounce-sensor.sock, endpoint_id=0x53415050
 2026-05-28 14:07:28,526 skybounce.client INFO state DISCONNECTED -> CONNECTING
 2026-05-28 14:07:28,528 skybounce.client INFO connected to /tmp/skybounce-sensor.sock
