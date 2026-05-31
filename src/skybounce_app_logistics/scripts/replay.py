@@ -33,13 +33,45 @@ from __future__ import annotations
 
 import argparse
 import logging
+import time
 from pathlib import Path
+from typing import Iterator
 
 from skybounce_event_rules import AnalyzerConfig, RULES_VERSION
 
-from ..csv_source import batch_frames
+from ..csv_source import SensorFrame, batch_frames
 from ..engine import run_engine
 from ..transport import FileTransport, IpcTransport
+
+
+def _pace_frames(frames: Iterator[SensorFrame], rate: float) -> Iterator[SensorFrame]:
+    """Yield frames at (rate × real-time) of their `ts_epoch_s` cadence.
+
+    rate=1.0 means real-time (1 s of CSV time = 1 s of wall time).
+    rate=10.0 means 10× faster (1 s of CSV = 100 ms of wall).
+    The first frame is yielded immediately to anchor both clocks; subsequent
+    frames wait until ``(ts_epoch_s - first.ts_epoch_s) / rate`` seconds have
+    elapsed on the wall clock since that first yield.
+
+    Frames whose ts_epoch_s does not advance (logger pause, clock jitter,
+    duplicate rows) yield immediately rather than blocking for negative time.
+
+    Raises ValueError if rate is non-positive.
+    """
+    if rate <= 0:
+        raise ValueError(f"rate must be positive, got {rate}")
+    start_csv: float | None = None
+    start_wall = time.monotonic()
+    for f in frames:
+        if start_csv is None:
+            start_csv = f.ts_epoch_s
+        else:
+            elapsed_csv = f.ts_epoch_s - start_csv
+            target_wall = start_wall + elapsed_csv / rate
+            delay = target_wall - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+        yield f
 
 
 # v0.1 placeholder endpoint_id. "SAPP" in ASCII; matches the IPC repo's
@@ -66,9 +98,18 @@ def main() -> None:
                         default=DEFAULT_ENDPOINT_ID,
                         help="32-bit endpoint identifier sent in HELLO "
                              "(--transport ipc only). Decimal, 0x hex, or 0o octal.")
+    parser.add_argument("--rate", type=float, default=None, metavar="N",
+                        help="Pace yields at N x real-time of the row timestamps "
+                             "(1.0 = real-time, 10.0 = 10x faster). Omit for "
+                             "burst behavior (read the CSV as fast as DictReader, "
+                             "the default). Useful for sustained-load bench tests "
+                             "and ACK-timing observation under realistic cadence.")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
+
+    if args.rate is not None and args.rate <= 0:
+        parser.error(f"--rate must be positive (got {args.rate})")
 
     logging.basicConfig(
         level=getattr(logging, args.log_level),
@@ -100,10 +141,17 @@ def main() -> None:
     print(f"Input:     {args.input}")
     print(f"Transport: {args.transport}")
     print(f"Output:    {out_descr}")
+    if args.rate is not None:
+        print(f"Rate:      {args.rate} x real-time (paced)")
+    else:
+        print(f"Rate:      burst (as-fast-as-possible)")
 
     cfg = AnalyzerConfig()
+    frames = batch_frames(args.input)
+    if args.rate is not None:
+        frames = _pace_frames(frames, args.rate)
     try:
-        run_engine(batch_frames(args.input), transport=transport, cfg=cfg)
+        run_engine(frames, transport=transport, cfg=cfg)
     finally:
         transport.close()
 
