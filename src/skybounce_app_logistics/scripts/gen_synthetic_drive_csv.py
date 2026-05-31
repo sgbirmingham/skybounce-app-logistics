@@ -105,6 +105,43 @@ def parse_event_spec(spec: str) -> list[tuple[str, float]]:
     return out
 
 
+def parse_auto_events(spec: str) -> list[tuple[str, float]]:
+    """Parse '--auto-events START:INTERVAL:COUNT[:PATTERN]' into [(type, t_s), ...].
+
+    Generates COUNT events spaced INTERVAL seconds apart, starting at START.
+    Event types rotate through PATTERN (default: 'brake,impact,accel').
+
+    Examples:
+        --auto-events 180:900:48          ->  48 events every 15 min starting at 180s,
+                                              rotating brake/impact/accel
+        --auto-events 180:60:30:brake     ->  30 brake events 1 min apart (cooldowns will
+                                              suppress most, but useful for stress tests)
+    """
+    parts = spec.split(":")
+    if len(parts) < 3 or len(parts) > 4:
+        raise ValueError(
+            f"auto-events spec must be 'START:INTERVAL:COUNT[:PATTERN]', got: {spec!r}"
+        )
+    try:
+        start = float(parts[0])
+        interval = float(parts[1])
+        count = int(parts[2])
+    except ValueError as e:
+        raise ValueError(f"auto-events numeric parse error: {e}") from e
+    if interval <= 0:
+        raise ValueError(f"interval must be positive, got {interval}")
+    if count <= 0:
+        raise ValueError(f"count must be positive, got {count}")
+
+    pattern = ["brake", "impact", "accel"]
+    if len(parts) == 4:
+        pattern = [p.strip() for p in parts[3].split(",") if p.strip()]
+        if not pattern:
+            raise ValueError(f"empty pattern in spec: {spec!r}")
+
+    return [(pattern[i % len(pattern)], start + i * interval) for i in range(count)]
+
+
 def session_id_from_seed(seed: int) -> str:
     """8-character hex session id, deterministic from seed."""
     rng = random.Random(seed)
@@ -314,7 +351,20 @@ def main(argv: Optional[list[str]] = None) -> int:
         help=(
             "Comma-separated event:timestamp pairs. "
             "Supported types: brake, accel, impact, moderate_impact. "
-            "(default: brake:180,impact:230,accel:285)"
+            "(default: brake:180,impact:230,accel:285) "
+            "Ignored if --auto-events is also given."
+        ),
+    )
+    p.add_argument(
+        "--auto-events",
+        type=str,
+        default=None,
+        metavar="START:INTERVAL:COUNT[:PATTERN]",
+        help=(
+            "Generate COUNT events at INTERVAL-second spacing starting at START. "
+            "PATTERN is a comma-separated rotation of event types "
+            "(default: brake,impact,accel). When set, supersedes --events. "
+            "Example: 180:900:48 -> 48 events every 15 min starting at t=180s."
         ),
     )
     p.add_argument(
@@ -341,7 +391,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = p.parse_args(argv)
 
     try:
-        events = parse_event_spec(args.events)
+        if args.auto_events is not None:
+            events = parse_auto_events(args.auto_events)
+        else:
+            events = parse_event_spec(args.events)
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
