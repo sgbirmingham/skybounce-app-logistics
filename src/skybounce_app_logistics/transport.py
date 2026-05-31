@@ -132,10 +132,16 @@ class IpcTransport:
         "LOG": "NORMAL",
     }
 
-    # Default close() drain budget. Long enough to absorb a burst-submit
-    # finishing the writer queue plus the daemon's QUEUED -> DELIVERED hop;
-    # short enough that a stuck daemon doesn't hang process shutdown.
-    _DEFAULT_CLOSE_DRAIN_TIMEOUT_S = 5.0
+    # close() drain ceiling for outstanding TELEMETRY_ACKs. Fixed regardless
+    # of queue depth: the L2 scheduler's throughput is the radio team's
+    # concern, not ours. _BS_ACK_WINDOW_S absorbs the BS round-trip;
+    # _EPOCHS_TO_DRAIN * _HF_EPOCH_S gives the radio its share of slots to
+    # clear in-flight frames. Default total: 60 + 8*15 = 180s (~3 min).
+    # If the queue can't drain in this window, remaining tids genuinely
+    # aren't getting through and TIMEOUT_NO_DISPOSITION is the right call.
+    _HF_EPOCH_S = 15.0           # s.py default --epoch-sec
+    _EPOCHS_TO_DRAIN = 8         # ~2 min of HF link time
+    _BS_ACK_WINDOW_S = 60.0      # generous BS round-trip absorption
 
     # Poll cadence while waiting for terminal dispositions. 20 ms keeps
     # the wait responsive without busy-looping; ACKs only flow during
@@ -163,12 +169,27 @@ class IpcTransport:
         self._Disposition = Disposition
         self._LinkState = LinkState
 
+        # Frozen DELIVERED value, used by both _on_telemetry_ack (guard
+        # against overwriting terminal state with later non-terminal acks)
+        # and close() (terminal-count predicate, per-tid final state log).
+        # Computed once here since self._Disposition is only valid after
+        # the deferred import above; effective equivalent of a class
+        # constant under that constraint.
+        self._DELIVERED = int(Disposition.DELIVERED)
+
         # Observability counters; surfaced in close() summary and via the
         # ack_counts / cmds_received properties (for tests, health checks,
         # or a future operator endpoint).
         self._count = 0
         self._cmds_received = 0
         self._ack_counts: dict[int, int] = {}
+
+        # Per-tid final disposition. Populated in emit() (None placeholder),
+        # updated in _on_telemetry_ack (guarded so terminal state is never
+        # overwritten by later non-terminal acks), read in close() to emit
+        # one log line per submitted tid. None at close = TIMEOUT_NO_DISPOSITION.
+        self._tid_state: dict[int, Optional[int]] = {}
+
         self._last_link_state: Optional[int] = None
 
         # Guard against double-close (drain timeout makes calling close()
@@ -218,6 +239,13 @@ class IpcTransport:
         """
         disp = int(ack.disposition)
         self._ack_counts[disp] = self._ack_counts.get(disp, 0) + 1
+        # Record per-tid state for close()'s final summary, guarded so a
+        # terminal disposition (DELIVERED or any 0x80-bit failure) is never
+        # overwritten by a later non-terminal ack. The IPC spec doesn't
+        # promise ack ordering across the wire, so don't depend on it.
+        existing = self._tid_state.get(ack.telemetry_id)
+        if existing is None or not (existing & 0x80 or existing == self._DELIVERED):
+            self._tid_state[ack.telemetry_id] = disp
         name = self._disposition_name(disp)
         if disp & 0x80:
             failed_total = sum(c for d, c in self._ack_counts.items() if d & 0x80)
@@ -299,7 +327,10 @@ class IpcTransport:
         ipc_prio_name = self._PRIORITY_MAP.get(event.priority, "NORMAL")
         ipc_prio = getattr(self._Priority, ipc_prio_name)
 
-        self._client.submit_telemetry(packed.bytes_payload, priority=ipc_prio)
+        tid = self._client.submit_telemetry(packed.bytes_payload, priority=ipc_prio)
+        # Seed per-tid state with None; _on_telemetry_ack will overwrite as
+        # dispositions arrive. Tids still None at close() = TIMEOUT_NO_DISPOSITION.
+        self._tid_state[tid] = None
         self._count += 1
 
     def close(self, drain_timeout_s: Optional[float] = None) -> None:
@@ -324,18 +355,24 @@ class IpcTransport:
         self._closed = True
 
         if drain_timeout_s is None:
-            drain_timeout_s = self._DEFAULT_CLOSE_DRAIN_TIMEOUT_S
+            # Formula: BS round-trip window plus N epochs of HF link time.
+            # Fixed regardless of queue depth -- the L2 scheduler's throughput
+            # is the radio team's concern, not ours. If the queue can't drain
+            # in this window, the remaining tids genuinely aren't getting
+            # through and TIMEOUT_NO_DISPOSITION is the correct outcome.
+            drain_timeout_s = (
+                self._BS_ACK_WINDOW_S
+                + self._EPOCHS_TO_DRAIN * self._HF_EPOCH_S
+            )
 
         if self._count > 0:
-            delivered = int(self._Disposition.DELIVERED)
-
             def _terminal_count() -> int:
                 # DELIVERED is the only success disposition; failures all set
                 # the 0x80 bit per spec Section 7.4. Intermediate states like
                 # QUEUED and TRANSMITTED don't count -- they aren't terminal.
                 return sum(
                     c for d, c in self._ack_counts.items()
-                    if d == delivered or (d & 0x80)
+                    if d == self._DELIVERED or (d & 0x80)
                 )
 
             deadline = time.monotonic() + drain_timeout_s
@@ -350,6 +387,30 @@ class IpcTransport:
                     "dropped at socket close",
                     drain_timeout_s, _terminal_count(), self._count, outstanding,
                 )
+
+            # Per-tid final-state log. Walks self._tid_state (populated in
+            # emit(), updated in _on_telemetry_ack); a tid still mapped to
+            # None or to a non-terminal disposition at this point timed out.
+            # TIMEOUT_NO_DISPOSITION is WARNING, not ERROR: the engine doesn't
+            # know whether the daemon actually delivered the frame, only that
+            # no terminal ACK arrived inside our drain window. s.py's own
+            # disposition log is the source of truth for what hit the wire.
+            for tid in sorted(self._tid_state):
+                disp = self._tid_state[tid]
+                if disp is None:
+                    log.warning(
+                        "tid=%d final=TIMEOUT_NO_DISPOSITION (no ACK received)",
+                        tid,
+                    )
+                elif disp == self._DELIVERED:
+                    log.info("tid=%d final=DELIVERED", tid)
+                elif disp & 0x80:
+                    log.warning("tid=%d final=FAILED(0x%02X)", tid, disp)
+                else:
+                    log.warning(
+                        "tid=%d final=TIMEOUT_NO_DISPOSITION last_seen=%s",
+                        tid, self._disposition_name(disp),
+                    )
 
         log.info("IPC transport closing, %d events submitted", self._count)
         if self._ack_counts:
