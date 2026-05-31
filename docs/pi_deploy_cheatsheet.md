@@ -186,6 +186,27 @@ Validated drives:
 - `vehicle_behavior_simple_logger_v0_1_2026-05-19_12-52-09.csv` (70 min, 21 hard events)
 - `vehicle_behavior_simple_logger_v0_1_2026-05-26_06-38-45.csv` (48 min, 14 hard events)
 
+### Optional: pace the replay to real-time (or any speed)
+
+Append `--rate N` to spread the replay across wall-clock time matching
+the row timestamps. Useful for testing sustained-load behavior at the
+IPC layer (daemon queue, ACK timing) without driving for an hour.
+
+```bash
+# Real-time replay — 48 min CSV takes 48 min:
+… --rate 1.0  …
+
+# 10x faster — 48 min CSV in ~5 min, still spaces events out:
+… --rate 10.0  …
+
+# 60x faster — 48 min CSV in ~50 sec, paced but bench-friendly:
+… --rate 60.0  …
+```
+
+Without `--rate`, replay runs in burst mode (the default; ~1 sec for any
+drive). Burst is best when you just want to compare event lists; `--rate`
+is best when you want to observe IPC behavior under realistic cadence.
+
 ## 7. Troubleshooting
 
 **`ModuleNotFoundError: No module named 'skybounce_client'`**
