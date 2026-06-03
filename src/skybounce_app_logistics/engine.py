@@ -147,6 +147,13 @@ class StreamingEngine:
         self._detect_point_events(feats, frame)
         self._update_state_tracking(feats)
         self._update_persistent_conditions(feats)
+        # Forward the frame clock to the transport. Lets a wrapping transport
+        # (P1BatchingTransport) close 5-min windows on time even if no events
+        # fire in a window. No-op on the per-event-only FileTransport and
+        # IpcTransport. hasattr guard keeps backward compat with any older
+        # Transport implementation that predates the tick() method.
+        if hasattr(self.transport, "tick"):
+            self.transport.tick(frame.ts_epoch_s, frame.elapsed_s)
 
     def flush(self) -> None:
         """Emit any pending interval events. Call at session end.
