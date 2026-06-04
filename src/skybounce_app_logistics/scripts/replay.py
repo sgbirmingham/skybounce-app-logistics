@@ -104,6 +104,18 @@ def main() -> None:
                              "burst behavior (read the CSV as fast as DictReader, "
                              "the default). Useful for sustained-load bench tests "
                              "and ACK-timing observation under realistic cadence.")
+    parser.add_argument("--batch-p1", action="store_true",
+                        help="Wrap the transport in a P1BatchingTransport: "
+                             "every P1 event_type is accumulated over 5-min "
+                             "wall-clock-aligned windows and emitted as a "
+                             "single SB45_SIM_V3 summary frame per type per "
+                             "window. P2 events pass through unchanged. Useful "
+                             "to ease pressure on the radio's intake queue "
+                             "under high-density P1 traffic. Default off.")
+    parser.add_argument("--batch-window-s", type=float, default=300.0,
+                        metavar="SEC",
+                        help="Window size in elapsed seconds for --batch-p1. "
+                             "Default 300 (5 min). Ignored without --batch-p1.")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
@@ -137,10 +149,21 @@ def main() -> None:
             return  # unreachable; parser.error exits
         out_descr = f"IPC endpoint_id=0x{args.endpoint_id:08X}"
 
+    # Optionally wrap with the P1 batcher. P2 / LOG events still flow through
+    # to the underlying transport untouched; P1 events get accumulated into
+    # per-type 5-min summaries.
+    if args.batch_p1:
+        from skybounce_app_logistics.p1_batcher import P1BatchingTransport
+        transport = P1BatchingTransport(transport, window_s=args.batch_window_s)
+
     print(f"Rules library: {RULES_VERSION}")
     print(f"Input:     {args.input}")
     print(f"Transport: {args.transport}")
     print(f"Output:    {out_descr}")
+    if args.batch_p1:
+        print(f"P1 batch:  on ({args.batch_window_s:.0f}s windows)")
+    else:
+        print(f"P1 batch:  off (per-event)")
     if args.rate is not None:
         print(f"Rate:      {args.rate} x real-time (paced)")
     else:
@@ -155,7 +178,14 @@ def main() -> None:
     finally:
         transport.close()
 
-    print(f"Events emitted: {transport.event_count}")
+    # event_count is exposed by FileTransport but not by every Transport (IPC,
+    # batched wrappers). hasattr keeps this summary line useful when present
+    # and silently skips it when not.
+    if hasattr(transport, "event_count"):
+        print(f"Records emitted: {transport.event_count}")
+    if hasattr(transport, "summaries_emitted"):
+        print(f"  of which summaries: {transport.summaries_emitted}")
+        print(f"  P1 events absorbed into summaries: {transport.p1_events_seen}")
 
 
 if __name__ == "__main__":

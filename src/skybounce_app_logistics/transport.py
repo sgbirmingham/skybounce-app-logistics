@@ -61,11 +61,45 @@ class Event:
 
 
 # -----------------------------------------------------------------------------
+# Batch-summary event (SB45_SIM_V3)
+# -----------------------------------------------------------------------------
+
+@dataclass
+class SummaryEvent:
+    """One 5-minute per-type P1 window summary, ready for SB45_SIM_V3 packing.
+
+    Produced by the P1BatchingTransport at window close; consumed by the
+    underlying Transport's emit_summary(). The IPC transport packs this via
+    pack_sb45_summary; the file transport writes it as a marked JSON line.
+
+    `window_end_elapsed_s` is the elapsed-time of the window boundary that
+    just closed; the basestation reads this as the SB45 `elapsed_min_bin`.
+
+    `window_idx` is a per-event-type rolling 0..7 counter, advanced once each
+    time a summary is emitted for that type. Lets the basestation detect a
+    dropped window for type X.
+    """
+    event_type: str
+    window_end_elapsed_s: float
+    window_idx: int
+    count: int
+    max_score: float
+    mean_score: float
+    last_gps_lat: Optional[float]
+    last_gps_lon: Optional[float]
+    last_location_status: str
+    anchor_lat: Optional[float]
+    anchor_lon: Optional[float]
+
+
+# -----------------------------------------------------------------------------
 # Transport interface
 # -----------------------------------------------------------------------------
 
 class Transport(Protocol):
     def emit(self, event: Event) -> None: ...
+    def emit_summary(self, summary: SummaryEvent) -> None: ...
+    def tick(self, ts_epoch_s: float, elapsed_s: float) -> None: ...
     def close(self) -> None: ...
 
 
@@ -95,8 +129,25 @@ class FileTransport:
         self._f.flush()  # one event = one line on disk, every time
         self._count += 1
 
+    def emit_summary(self, summary: SummaryEvent) -> None:
+        """Write a P1 batch-summary record as a JSON line. Marked with
+        `record_type: "summary"` so downstream readers can distinguish summary
+        lines from per-event lines (which have no `record_type` field today)."""
+        record = asdict(summary)
+        record["record_type"] = "summary"
+        record["sb45_layout_version"] = "SB45_SIM_V3"
+        self._f.write(json.dumps(record, sort_keys=True) + "\n")
+        self._f.flush()
+        self._count += 1
+
+    def tick(self, ts_epoch_s: float, elapsed_s: float) -> None:
+        """No-op for the file transport. The P1BatchingTransport calls this
+        on every wrapped transport to keep the interface uniform, but the
+        file transport has no time-based bookkeeping of its own."""
+        pass
+
     def close(self) -> None:
-        log.info("file transport closing, %d events written to %s",
+        log.info("file transport closing, %d records written to %s",
                  self._count, self._path)
         self._f.close()
 
@@ -149,7 +200,9 @@ class IpcTransport:
             from skybounce_ipc import (
                 CmdResult, Disposition, LinkState, Priority,
             )
-            from sb_telemetry_payload import SB45Event, pack_sb45
+            from sb_telemetry_payload import (
+                SB45Event, SB45Summary, pack_sb45, pack_sb45_summary,
+            )
         except ImportError as e:
             raise ImportError(
                 "IPC transport requires skybounce-ipc-python on PYTHONPATH. "
@@ -157,7 +210,9 @@ class IpcTransport:
             ) from e
 
         self._SB45Event = SB45Event
+        self._SB45Summary = SB45Summary
         self._pack_sb45 = pack_sb45
+        self._pack_sb45_summary = pack_sb45_summary
         self._Priority = Priority
         self._CmdResult = CmdResult
         self._Disposition = Disposition
@@ -301,6 +356,45 @@ class IpcTransport:
 
         self._client.submit_telemetry(packed.bytes_payload, priority=ipc_prio)
         self._count += 1
+
+    def emit_summary(self, summary: SummaryEvent) -> None:
+        """Pack a P1 batch summary via SB45_SIM_V3 (pack_sb45_summary) and
+        submit it as a TELEMETRY frame. pack_sb45_summary hard-codes the
+        SB45 priority field to BATCH_SUMMARY (=3) regardless of what we pass.
+        The IPC frame's own priority is ELEVATED (same as a P1 per-event)
+        because a summary REPRESENTS P1 events; we don't want the radio's
+        TX scheduler to de-prioritize it.
+        """
+        sb45_summary = self._SB45Summary(
+            event_type=summary.event_type,
+            priority="BATCH_SUMMARY",
+            location_status=summary.last_location_status,
+            window_idx=summary.window_idx,
+            count=summary.count,
+            max_score=summary.max_score,
+            mean_score=summary.mean_score,
+            window_end_elapsed_s=summary.window_end_elapsed_s,
+            lat=summary.last_gps_lat,
+            lon=summary.last_gps_lon,
+            anchor_lat=summary.anchor_lat,
+            anchor_lon=summary.anchor_lon,
+        )
+        packed = self._pack_sb45_summary(sb45_summary)
+        ipc_prio = getattr(self._Priority, "ELEVATED")
+        self._client.submit_telemetry(packed.bytes_payload, priority=ipc_prio)
+        self._count += 1
+        log.info(
+            "emit_summary: type=%s window_end=%.0fs count=%d max=%.2f mean=%.2f",
+            summary.event_type, summary.window_end_elapsed_s,
+            summary.count, summary.max_score, summary.mean_score,
+        )
+
+    def tick(self, ts_epoch_s: float, elapsed_s: float) -> None:
+        """No-op for the IPC transport. The P1BatchingTransport calls this
+        on every wrapped transport to keep the interface uniform; the IPC
+        transport has no time-based bookkeeping of its own (the IPC client's
+        keep-alive runs on its own thread)."""
+        pass
 
     def close(self, drain_timeout_s: Optional[float] = None) -> None:
         """Drain pending submissions (best-effort), log summary, stop client.
