@@ -169,8 +169,11 @@ def test_window_boundaries_aligned_when_first_event_late():
 
 
 def test_one_summary_per_type_per_window():
+    # summary_jitter_s=0 keeps the original semantics: all queued summaries
+    # fire on the same tick that closes the window. Jitter-on behavior is
+    # exercised by the dedicated tests below.
     spy = SpyTransport()
-    batcher = P1BatchingTransport(spy, window_s=300.0)
+    batcher = P1BatchingTransport(spy, window_s=300.0, summary_jitter_s=0)
     # Two types, one event each in the first window.
     batcher.emit(make_event(
         event_type="moderate_impact", priority="P1", elapsed_s=10.0,
@@ -236,8 +239,10 @@ def test_window_idx_advances_per_type_mod_8():
 
 
 def test_window_idx_per_type_independent():
+    # summary_jitter_s=0 again -- this test asserts on per-tick summary
+    # output, which requires the jitter-free same-tick emit pattern.
     spy = SpyTransport()
-    batcher = P1BatchingTransport(spy, window_s=300.0)
+    batcher = P1BatchingTransport(spy, window_s=300.0, summary_jitter_s=0)
     # window 1: only type A
     batcher.emit(make_event(
         event_type="moderate_impact", priority="P1", elapsed_s=10.0,
@@ -350,3 +355,113 @@ def test_negative_window_rejected():
     spy = SpyTransport()
     with pytest.raises(ValueError):
         P1BatchingTransport(spy, window_s=-10.0)
+
+
+def test_negative_jitter_rejected():
+    spy = SpyTransport()
+    with pytest.raises(ValueError):
+        P1BatchingTransport(spy, summary_jitter_s=-1.0)
+
+
+def test_jitter_at_least_window_rejected():
+    spy = SpyTransport()
+    with pytest.raises(ValueError):
+        # jitter == window_s would let one window's emissions spill into
+        # the next; jitter > window_s is worse. Both rejected.
+        P1BatchingTransport(spy, window_s=300.0, summary_jitter_s=300.0)
+    with pytest.raises(ValueError):
+        P1BatchingTransport(spy, window_s=300.0, summary_jitter_s=400.0)
+
+
+# -----------------------------------------------------------------------------
+# Summary jitter: staggered emission to avoid burst-into-intake-queue
+# -----------------------------------------------------------------------------
+
+def test_jitter_staggers_emits_across_subsequent_ticks():
+    """With jitter=60 and N=4 summaries queued at window close, only the
+    i=0 entry (offset 0) fires on the boundary tick. The i=1..3 entries
+    fire on subsequent ticks as ts_epoch_s advances past their offsets
+    of 15, 30, 45 seconds."""
+    spy = SpyTransport()
+    batcher = P1BatchingTransport(spy, window_s=300.0, summary_jitter_s=60.0)
+    # Four distinct P1 types in the first window.
+    for et in ("hard_accel", "hard_brake", "moderate_impact", "state_highway"):
+        batcher.emit(make_event(event_type=et, priority="P1", elapsed_s=10.0))
+
+    # Tick at the boundary -- base_ts = 100, spacing = 60/4 = 15.
+    batcher.tick(ts_epoch_s=100.0, elapsed_s=300.0)
+    # Only i=0 (offset 0) drains.
+    assert len(spy.summaries) == 1
+
+    # Advance ts to 100 + 15 -> i=1 also drains.
+    batcher.tick(ts_epoch_s=115.0, elapsed_s=301.0)
+    assert len(spy.summaries) == 2
+
+    # 100 + 30 -> i=2.
+    batcher.tick(ts_epoch_s=130.0, elapsed_s=302.0)
+    assert len(spy.summaries) == 3
+
+    # 100 + 45 -> i=3.
+    batcher.tick(ts_epoch_s=145.0, elapsed_s=303.0)
+    assert len(spy.summaries) == 4
+
+
+def test_jitter_off_emits_immediately():
+    """summary_jitter_s=0 means spacing=0, so all queued entries have
+    not_before == base_ts and all drain on the same boundary tick."""
+    spy = SpyTransport()
+    batcher = P1BatchingTransport(spy, window_s=300.0, summary_jitter_s=0)
+    for et in ("hard_accel", "hard_brake", "moderate_impact"):
+        batcher.emit(make_event(event_type=et, priority="P1", elapsed_s=10.0))
+    batcher.tick(ts_epoch_s=100.0, elapsed_s=300.0)
+    assert len(spy.summaries) == 3
+
+
+def test_close_flushes_pending_jitter_emits():
+    """close() emits any still-pending summaries regardless of their
+    not_before timestamps. Without this, sessions that end before all
+    staggered entries have drained would lose summaries."""
+    spy = SpyTransport()
+    batcher = P1BatchingTransport(spy, window_s=300.0, summary_jitter_s=60.0)
+    for et in ("hard_accel", "hard_brake", "moderate_impact", "state_highway"):
+        batcher.emit(make_event(event_type=et, priority="P1", elapsed_s=10.0))
+    batcher.tick(ts_epoch_s=100.0, elapsed_s=300.0)
+    # Only i=0 drained so far.
+    assert len(spy.summaries) == 1
+    # close() flushes the remaining 3.
+    batcher.close()
+    assert len(spy.summaries) == 4
+    assert spy.closed is True
+
+
+def test_jitter_single_summary_fires_immediately():
+    """When only one type fires in a window, N=1 means offset = 0 and the
+    summary fires on the same tick as the window close."""
+    spy = SpyTransport()
+    batcher = P1BatchingTransport(spy, window_s=300.0, summary_jitter_s=60.0)
+    batcher.emit(make_event(
+        event_type="moderate_impact", priority="P1", elapsed_s=10.0,
+    ))
+    batcher.tick(ts_epoch_s=100.0, elapsed_s=300.0)
+    assert len(spy.summaries) == 1
+
+
+def test_jitter_preserves_window_idx_at_queue_time():
+    """window_idx advances when the summary is queued, not when it's
+    actually emitted -- so two consecutive windows queue idx 0 and idx 1
+    even if the basestation receives them with the wire order staggered."""
+    spy = SpyTransport()
+    batcher = P1BatchingTransport(spy, window_s=300.0, summary_jitter_s=60.0)
+    # Window 1.
+    batcher.emit(make_event(
+        event_type="moderate_impact", priority="P1", elapsed_s=10.0,
+    ))
+    # Drain idx 0.
+    batcher.tick(ts_epoch_s=100.0, elapsed_s=300.0)
+    # Window 2.
+    batcher.emit(make_event(
+        event_type="moderate_impact", priority="P1", elapsed_s=310.0,
+    ))
+    batcher.tick(ts_epoch_s=400.0, elapsed_s=600.0)
+    indices = [s.window_idx for s in spy.summaries]
+    assert indices == [0, 1]

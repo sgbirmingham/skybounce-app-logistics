@@ -43,9 +43,23 @@ Design (SB45_SIM_V3)
   not be delayed. LOG is debatable — for v1 we pass through; future tuning
   can move LOG into a separate batch with a longer window if traffic warrants.
 
-- `close()` flushes any open window with count >= 1, then closes the wrapped
-  transport. Sessions that end mid-window still report their partial-window
-  P1 activity.
+- Summary jitter: when N P1 types fire in the same window, emitting all N
+  summary frames simultaneously at the boundary creates exactly the burst
+  the radio's intake queue can't absorb (this is the failure mode we saw
+  on 2026-06-04 -- the run had to be aborted). To avoid it, summaries are
+  not emitted directly; they go into a pending-emit queue with target
+  ts_epoch_s offsets `0, jitter/N, 2*jitter/N, ...` and are drained on
+  subsequent `tick()` calls as ts_epoch_s advances past each target. The
+  engine never blocks on time.sleep -- the per-frame tick cadence drives
+  the staggered emission naturally. Default jitter = 60 sec; 0 disables.
+  Must be < `window_s` so a window's emissions finish before the next
+  window closes.
+
+- `close()` flushes any open window with count >= 1, then flushes any
+  still-pending deferred emits regardless of their scheduled time
+  (sessions ending mid-jitter still get their summaries on the wire),
+  then closes the wrapped transport. Sessions that end mid-window also
+  report their partial-window P1 activity.
 
 Lifecycle
 ---------
@@ -71,6 +85,15 @@ log = logging.getLogger(__name__)
 
 
 DEFAULT_WINDOW_S = 300.0  # 5 minutes
+DEFAULT_SUMMARY_JITTER_S = 60.0  # spread N summaries over 60 s at window close
+
+
+@dataclass
+class _PendingEmit:
+    """One summary scheduled for deferred emission. The batcher's tick()
+    drains entries whose not_before_ts_epoch_s has been reached."""
+    summary: "SummaryEvent"
+    not_before_ts_epoch_s: float
 
 
 @dataclass
@@ -121,12 +144,24 @@ class P1BatchingTransport:
         self,
         inner: Transport,
         window_s: float = DEFAULT_WINDOW_S,
+        summary_jitter_s: float = DEFAULT_SUMMARY_JITTER_S,
         batch_log_priority: bool = False,
     ) -> None:
         if window_s <= 0.0:
             raise ValueError(f"window_s must be positive, got {window_s!r}")
+        if summary_jitter_s < 0.0:
+            raise ValueError(
+                f"summary_jitter_s must be >= 0, got {summary_jitter_s!r}"
+            )
+        if summary_jitter_s >= window_s:
+            raise ValueError(
+                f"summary_jitter_s ({summary_jitter_s}) must be < window_s "
+                f"({window_s}); otherwise the next window starts before the "
+                f"previous window's summaries finish emitting."
+            )
         self._inner = inner
         self._window_s = float(window_s)
+        self._summary_jitter_s = float(summary_jitter_s)
         # Also batch LOG events? Off by default; reserved for a follow-up
         # tuning step once we have data on how much LOG traffic matters.
         self._batch_log_priority = bool(batch_log_priority)
@@ -142,12 +177,22 @@ class P1BatchingTransport:
         # set on first call so the first window aligns with that elapsed_s.
         self._current_window_end_s: Optional[float] = None
 
+        # Deferred-emit queue: summaries pending release as ts_epoch_s
+        # advances past each entry's not_before time. _close_window()
+        # appends; tick() and close() drain.
+        self._pending_emits: list[_PendingEmit] = []
+
+        # Last tick's ts_epoch_s -- the clock against which not_before is
+        # compared. None until the first tick.
+        self._last_tick_ts_epoch_s: Optional[float] = None
+
         # Observability counters.
         self._p1_events_seen = 0
         self._summaries_emitted = 0
 
-        log.info("P1BatchingTransport: window_s=%.0fs, batch_log=%s",
-                 self._window_s, self._batch_log_priority)
+        log.info("P1BatchingTransport: window_s=%.0fs, jitter=%.0fs, batch_log=%s",
+                 self._window_s, self._summary_jitter_s,
+                 self._batch_log_priority)
 
     # -------------------------------------------------------------------------
     # Transport protocol
@@ -176,11 +221,19 @@ class P1BatchingTransport:
         self._inner.emit_summary(summary)
 
     def tick(self, ts_epoch_s: float, elapsed_s: float) -> None:
-        """Advance the window clock. If `elapsed_s` has crossed one or more
-        window boundaries since last tick, flush each crossed window in
-        order (so multiple sparse ticks with gaps still produce the right
-        sequence of summary frames). Then propagate the tick to the inner
-        transport (no-op on FileTransport / IpcTransport)."""
+        """Advance the window clock. Three things happen, in order:
+
+        1. If `elapsed_s` has crossed one or more window boundaries since
+           last tick, queue each crossed window's summaries with staggered
+           not_before timestamps (so they don't burst into the radio's
+           intake queue simultaneously).
+        2. Drain any pending emits whose not_before has been reached --
+           including the just-queued i=0 entry, which has not_before equal
+           to this tick's ts_epoch_s and so fires immediately.
+        3. Propagate the tick to the inner transport (no-op on
+           FileTransport / IpcTransport).
+        """
+        self._last_tick_ts_epoch_s = ts_epoch_s
         self._lazy_init_window(elapsed_s)
         # Defensive: typing-wise, _lazy_init_window guarantees this isn't None.
         assert self._current_window_end_s is not None
@@ -189,17 +242,29 @@ class P1BatchingTransport:
             self._close_window(self._current_window_end_s)
             self._current_window_end_s += self._window_s
 
+        self._drain_pending(ts_epoch_s)
         self._inner.tick(ts_epoch_s, elapsed_s)
 
     def close(self) -> None:
-        """Flush any open window (count >= 1 per type) and close inner.
+        """Flush any open window and any still-pending deferred emits, then
+        close the wrapped transport.
 
         Sessions ending mid-window still get their partial-window stats
-        reported. The summary's window_end_elapsed_s is the planned
-        boundary, even though only a partial slice of the window ran;
-        count tells the basestation how many events actually fired."""
+        reported (the summary's window_end_elapsed_s is the planned
+        boundary; count tells the basestation how many events actually
+        fired in the partial slice).
+
+        Sessions ending mid-jitter still get their staggered emits on the
+        wire (we ignore the not_before times here so nothing is lost --
+        the staggering only matters while the session is live and trying
+        to avoid intake-queue bursts)."""
         if self._current_window_end_s is not None:
             self._close_window(self._current_window_end_s)
+        # Drain everything left, ignoring not_before timestamps.
+        for entry in self._pending_emits:
+            self._inner.emit_summary(entry.summary)
+            self._summaries_emitted += 1
+        self._pending_emits.clear()
         log.info(
             "P1BatchingTransport closing: p1_events_seen=%d, summaries_emitted=%d",
             self._p1_events_seen, self._summaries_emitted,
@@ -237,16 +302,23 @@ class P1BatchingTransport:
         return (n_completed + 1) * self._window_s
 
     def _close_window(self, window_end_s: float) -> None:
-        """Emit one SummaryEvent per event_type with count >= 1, then clear
-        the buckets. window_idx is advanced per type."""
-        if not self._buckets:
-            return
-        for event_type in sorted(self._buckets.keys()):
-            bucket = self._buckets[event_type]
+        """Queue one SummaryEvent per event_type with count >= 1 for deferred
+        emission, with not_before timestamps spaced 0, jitter/N, 2*jitter/N,
+        ... so the N entries don't burst into the inner transport at the
+        same wall-clock instant. window_idx is advanced per type at queue
+        time (the basestation sees indexes in the order summaries are
+        conceptually emitted, even though wire-time is staggered)."""
+        # Buckets snapshot -> empty before anything else, so the next window
+        # starts clean even if pending-emit queueing throws.
+        bucket_items = sorted(self._buckets.items())
+        self._buckets.clear()
+
+        pending_summaries: list[SummaryEvent] = []
+        for event_type, bucket in bucket_items:
             if bucket.count == 0:
                 continue
             idx = self._window_idx.get(event_type, 0)
-            summary = SummaryEvent(
+            pending_summaries.append(SummaryEvent(
                 event_type=event_type,
                 window_end_elapsed_s=window_end_s,
                 window_idx=idx,
@@ -258,8 +330,38 @@ class P1BatchingTransport:
                 last_location_status=bucket.last_location_status,
                 anchor_lat=bucket.anchor_lat,
                 anchor_lon=bucket.anchor_lon,
-            )
-            self._inner.emit_summary(summary)
-            self._summaries_emitted += 1
+            ))
             self._window_idx[event_type] = (idx + 1) % 8
-        self._buckets.clear()
+
+        n = len(pending_summaries)
+        if n == 0:
+            return
+
+        # Base ts for the staggered offsets: the latest tick we've seen.
+        # In normal operation _close_window is called from tick(), which
+        # set _last_tick_ts_epoch_s on entry, so this is non-None. If a
+        # caller closes a window outside tick() (e.g. close()), we fall
+        # through to a 0-base which makes every entry immediately drainable.
+        base_ts = self._last_tick_ts_epoch_s if self._last_tick_ts_epoch_s is not None else 0.0
+        spacing = (self._summary_jitter_s / n) if self._summary_jitter_s > 0 else 0.0
+        for i, summary in enumerate(pending_summaries):
+            self._pending_emits.append(_PendingEmit(
+                summary=summary,
+                not_before_ts_epoch_s=base_ts + i * spacing,
+            ))
+
+    def _drain_pending(self, ts_epoch_s: float) -> None:
+        """Emit any pending summaries whose not_before time has been reached.
+        Order is preserved; entries are removed in place. Called from tick()
+        after _close_window() so the i=0 entry queued this tick (offset 0)
+        fires immediately."""
+        if not self._pending_emits:
+            return
+        still_pending: list[_PendingEmit] = []
+        for entry in self._pending_emits:
+            if entry.not_before_ts_epoch_s <= ts_epoch_s:
+                self._inner.emit_summary(entry.summary)
+                self._summaries_emitted += 1
+            else:
+                still_pending.append(entry)
+        self._pending_emits = still_pending

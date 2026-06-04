@@ -116,6 +116,16 @@ def main() -> None:
                         metavar="SEC",
                         help="Window size in elapsed seconds for --batch-p1. "
                              "Default 300 (5 min). Ignored without --batch-p1.")
+    parser.add_argument("--summary-jitter-s", type=float, default=60.0,
+                        metavar="SEC",
+                        help="At each window close, spread the N summary "
+                             "frames over this many seconds (offsets 0, "
+                             "jitter/N, 2*jitter/N, ...). Without this, all "
+                             "summaries hit the radio's intake queue at the "
+                             "same instant, overflowing it and triggering "
+                             "DROPPED_BUFFER_FULL. 0 disables. Default 60. "
+                             "Must be < --batch-window-s. Ignored without "
+                             "--batch-p1.")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
@@ -154,7 +164,11 @@ def main() -> None:
     # per-type 5-min summaries.
     if args.batch_p1:
         from skybounce_app_logistics.p1_batcher import P1BatchingTransport
-        transport = P1BatchingTransport(transport, window_s=args.batch_window_s)
+        transport = P1BatchingTransport(
+            transport,
+            window_s=args.batch_window_s,
+            summary_jitter_s=args.summary_jitter_s,
+        )
 
     print(f"Rules library: {RULES_VERSION}")
     print(f"Input:     {args.input}")
