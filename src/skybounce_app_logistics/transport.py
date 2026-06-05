@@ -208,7 +208,8 @@ class IpcTransport:
         self,
         endpoint_id: int,
         socket_path: Optional[str] = None,
-        max_retries: int = 3,
+        max_retries: int = 10,
+        max_retry_window_s: float = 600.0,
         max_submit_rate_per_min: float = 0.0,
     ) -> None:
         # Defer imports until construction so module imports cleanly without IPC.
@@ -250,12 +251,23 @@ class IpcTransport:
         # lock protects retry_queue from concurrent access between the
         # SkyBounceClient reader thread (which enqueues from _on_telemetry_ack)
         # and the engine's tick() thread (which dequeues + re-submits).
+        #
+        # Two-axis bound on retry behavior:
+        #   max_retries: absolute attempt count cap per origin (safety belt).
+        #   max_retry_window_s: wall-clock cap per origin (PRIMARY effective
+        #       limit). origin_submitted_at is recorded at first attempt and
+        #       propagated through the retry chain, so the window measures
+        #       the whole chain, not just the latest attempt.
         self._max_retries = int(max_retries)
+        self._max_retry_window_s = float(max_retry_window_s)
         self._tid_to_payload: dict[int, tuple] = {}
         self._tid_to_retry_count: dict[int, int] = {}
+        self._tid_to_origin_submitted_at: dict[int, float] = {}
         self._retry_queue: list = []
         self._retry_queue_lock = threading.Lock()
         self._retries_submitted = 0
+        self._retries_abandoned_window = 0
+        self._retries_abandoned_count = 0
 
         # Sliding-60s submission rate limit. Applies to every wire submission
         # (emit, emit_summary, retry). 0 = unlimited (existing behavior).
@@ -327,7 +339,10 @@ class IpcTransport:
         self._ack_counts[disp] = self._ack_counts.get(disp, 0) + 1
         name = self._disposition_name(disp)
 
-        # Queue a retry on BUFFER_FULL if we have attempts left for this tid.
+        # Queue a retry on BUFFER_FULL if BOTH limits allow it:
+        #   (a) attempt < max_retries  (absolute safety backstop)
+        #   (b) elapsed since origin's first submit < max_retry_window_s
+        #       (PRIMARY effective limit, matches contract's 25-min framing)
         # The ACK handler runs on the SkyBounceClient reader thread; the
         # actual re-submission happens later in tick(), so this handler never
         # blocks on rate-limit sleeps or socket I/O.
@@ -335,7 +350,14 @@ class IpcTransport:
                 and disp == 0x80   # DROPPED_BUFFER_FULL
                 and ack.telemetry_id in self._tid_to_payload):
             attempt = self._tid_to_retry_count.get(ack.telemetry_id, 0)
-            if attempt < self._max_retries:
+            origin_at = self._tid_to_origin_submitted_at.get(
+                ack.telemetry_id, time.monotonic()
+            )
+            elapsed_since_origin = time.monotonic() - origin_at
+            window_ok = (self._max_retry_window_s <= 0.0
+                         or elapsed_since_origin < self._max_retry_window_s)
+            count_ok = attempt < self._max_retries
+            if count_ok and window_ok:
                 kind, payload = self._tid_to_payload[ack.telemetry_id]
                 backoff = min(
                     self._RETRY_INITIAL_BACKOFF_S
@@ -344,17 +366,29 @@ class IpcTransport:
                 )
                 with self._retry_queue_lock:
                     self._retry_queue.append((
-                        kind, payload, time.monotonic() + backoff, attempt + 1,
+                        kind, payload, time.monotonic() + backoff,
+                        attempt + 1, origin_at,
                     ))
                 log.info(
                     "retry queued for tid=%d (BUFFER_FULL); attempt #%d, "
-                    "backoff=%.0fs",
+                    "backoff=%.0fs, origin %.0fs ago",
                     ack.telemetry_id, attempt + 1, backoff,
+                    elapsed_since_origin,
+                )
+            elif not count_ok:
+                self._retries_abandoned_count += 1
+                log.warning(
+                    "retry exhausted for tid=%d (max-retries=%d hit, origin "
+                    "%.0fs ago); giving up",
+                    ack.telemetry_id, self._max_retries, elapsed_since_origin,
                 )
             else:
+                self._retries_abandoned_window += 1
                 log.warning(
-                    "retry exhausted for tid=%d after %d attempts; giving up",
-                    ack.telemetry_id, attempt,
+                    "retry abandoned for tid=%d (origin %.0fs ago exceeds "
+                    "max_retry_window_s=%.0fs); giving up after %d attempts",
+                    ack.telemetry_id, elapsed_since_origin,
+                    self._max_retry_window_s, attempt,
                 )
 
         if disp & 0x80:
@@ -496,8 +530,10 @@ class IpcTransport:
     def _drain_retry_queue(self) -> int:
         """Re-submit any retry entries whose backoff has expired. Each retry
         gets a NEW tid; the original tid stays in its terminal failed state.
-        Called from tick() so retry I/O happens on the engine's main thread
-        (never the ACK reader thread).
+        origin_submitted_at is propagated forward through the chain so the
+        wall-clock window measures the whole chain (not just the latest
+        attempt). Called from tick() so retry I/O happens on the engine's
+        main thread (never the ACK reader thread).
 
         Returns the number of retries actually re-submitted on this call
         (0 if nothing was due yet).
@@ -514,19 +550,21 @@ class IpcTransport:
                 (due if entry[2] <= now else not_due).append(entry)
             self._retry_queue[:] = not_due
         n_submitted = 0
-        for kind, payload, _not_before, attempt in due:
+        for kind, payload, _not_before, attempt, origin_at in due:
             if kind == "event":
                 new_tid = self._pack_and_submit_event(payload)
             else:  # "summary"
                 new_tid = self._pack_and_submit_summary(payload)
             self._tid_to_payload[new_tid] = (kind, payload)
             self._tid_to_retry_count[new_tid] = attempt
+            self._tid_to_origin_submitted_at[new_tid] = origin_at
             self._retries_submitted += 1
             self._count += 1
             n_submitted += 1
             log.info(
-                "retry submitted: kind=%s attempt=%d new_tid=%d",
-                kind, attempt, new_tid,
+                "retry submitted: kind=%s attempt=%d new_tid=%d "
+                "(origin %.0fs ago)",
+                kind, attempt, new_tid, now - origin_at,
             )
         return n_submitted
 
@@ -539,6 +577,7 @@ class IpcTransport:
         if self._max_retries > 0:
             self._tid_to_payload[tid] = ("event", event)
             self._tid_to_retry_count[tid] = 0
+            self._tid_to_origin_submitted_at[tid] = time.monotonic()
         self._count += 1
 
     def emit_summary(self, summary: SummaryEvent) -> None:
@@ -553,6 +592,7 @@ class IpcTransport:
         if self._max_retries > 0:
             self._tid_to_payload[tid] = ("summary", summary)
             self._tid_to_retry_count[tid] = 0
+            self._tid_to_origin_submitted_at[tid] = time.monotonic()
         self._count += 1
         log.info(
             "emit_summary: tid=%d type=%s window_end=%.0fs count=%d max=%.2f mean=%.2f",
