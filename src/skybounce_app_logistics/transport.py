@@ -17,12 +17,14 @@ Both implement the same Transport protocol: emit(event) and close().
 
 from __future__ import annotations
 
+import collections
 import json
 import logging
+import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Optional, Protocol
+from typing import Any, Optional, Protocol
 
 
 log = logging.getLogger("skybounce.app.logistics.transport")
@@ -193,7 +195,22 @@ class IpcTransport:
     # daemon round-trips so finer granularity buys nothing.
     _DRAIN_POLL_INTERVAL_S = 0.02
 
-    def __init__(self, endpoint_id: int, socket_path: Optional[str] = None) -> None:
+    # Retry-on-BUFFER_FULL backoff schedule. Per the 2026-06-04 radio team
+    # memo, 0x80 is backpressure rather than a hard failure: the radio is
+    # telling us the intake queue is momentarily full. Re-submitting after
+    # a backoff usually recovers the frame. The original tid stays in its
+    # contract-correct terminal failed state; the retry is a new tid.
+    _RETRY_INITIAL_BACKOFF_S = 10.0
+    _RETRY_BACKOFF_FACTOR = 2.0
+    _RETRY_BACKOFF_MAX_S = 120.0
+
+    def __init__(
+        self,
+        endpoint_id: int,
+        socket_path: Optional[str] = None,
+        max_retries: int = 3,
+        max_submit_rate_per_min: float = 0.0,
+    ) -> None:
         # Defer imports until construction so module imports cleanly without IPC.
         try:
             from skybounce_client import SkyBounceClient
@@ -226,6 +243,30 @@ class IpcTransport:
         self._ack_counts: dict[int, int] = {}
         self._last_link_state: Optional[int] = None
 
+        # Retry-on-BUFFER_FULL state. Per-tid payload mapping lets the ACK
+        # handler reconstruct the Event/SummaryEvent to re-submit when 0x80
+        # fires. retry_queue holds entries that haven't yet aged through
+        # their exponential backoff; tick() drains it on each call. The
+        # lock protects retry_queue from concurrent access between the
+        # SkyBounceClient reader thread (which enqueues from _on_telemetry_ack)
+        # and the engine's tick() thread (which dequeues + re-submits).
+        self._max_retries = int(max_retries)
+        self._tid_to_payload: dict[int, tuple] = {}
+        self._tid_to_retry_count: dict[int, int] = {}
+        self._retry_queue: list = []
+        self._retry_queue_lock = threading.Lock()
+        self._retries_submitted = 0
+
+        # Sliding-60s submission rate limit. Applies to every wire submission
+        # (emit, emit_summary, retry). 0 = unlimited (existing behavior).
+        # When the cap is reached, _rate_limited_submit_telemetry sleeps until
+        # the oldest timestamp ages out. recent_submit_ts is only touched
+        # from the engine's tick/emit thread, never from the ACK handler,
+        # so no lock needed.
+        self._max_submit_rate_per_min = float(max_submit_rate_per_min)
+        self._recent_submit_ts: collections.deque = collections.deque()
+        self._rate_limit_sleeps = 0
+
         # Guard against double-close (drain timeout makes calling close()
         # twice expensive otherwise, and SkyBounceClient.stop() is not
         # documented as idempotent).
@@ -240,7 +281,13 @@ class IpcTransport:
         self._client.set_status_handler(self._on_status)
 
         self._client.start()
-        log.info("IPC transport started, endpoint_id=0x%08X", endpoint_id)
+        log.info(
+            "IPC transport started, endpoint_id=0x%08X, max_retries=%d, "
+            "rate_limit=%s/min",
+            endpoint_id, self._max_retries,
+            f"{self._max_submit_rate_per_min:.0f}"
+            if self._max_submit_rate_per_min > 0 else "unlimited",
+        )
 
     # -------------------------------------------------------------------------
     # Handlers
@@ -270,10 +317,46 @@ class IpcTransport:
         Per the v1.0 known limitations, DELIVERED is a hand-off confirmation,
         not an L1 ACK from the base station -- callers who care about that
         distinction should consult sensor_ipc_KNOWN_LIMITATIONS.md.
+
+        On DROPPED_BUFFER_FULL (0x80) with retries remaining, the originating
+        Event or SummaryEvent is queued for re-submission. The original tid
+        stays in its terminal failed state per the v1.0 contract; the retry
+        is a new submission (new tid). Bounded at max_retries per origin.
         """
         disp = int(ack.disposition)
         self._ack_counts[disp] = self._ack_counts.get(disp, 0) + 1
         name = self._disposition_name(disp)
+
+        # Queue a retry on BUFFER_FULL if we have attempts left for this tid.
+        # The ACK handler runs on the SkyBounceClient reader thread; the
+        # actual re-submission happens later in tick(), so this handler never
+        # blocks on rate-limit sleeps or socket I/O.
+        if (self._max_retries > 0
+                and disp == 0x80   # DROPPED_BUFFER_FULL
+                and ack.telemetry_id in self._tid_to_payload):
+            attempt = self._tid_to_retry_count.get(ack.telemetry_id, 0)
+            if attempt < self._max_retries:
+                kind, payload = self._tid_to_payload[ack.telemetry_id]
+                backoff = min(
+                    self._RETRY_INITIAL_BACKOFF_S
+                    * (self._RETRY_BACKOFF_FACTOR ** attempt),
+                    self._RETRY_BACKOFF_MAX_S,
+                )
+                with self._retry_queue_lock:
+                    self._retry_queue.append((
+                        kind, payload, time.monotonic() + backoff, attempt + 1,
+                    ))
+                log.info(
+                    "retry queued for tid=%d (BUFFER_FULL); attempt #%d, "
+                    "backoff=%.0fs",
+                    ack.telemetry_id, attempt + 1, backoff,
+                )
+            else:
+                log.warning(
+                    "retry exhausted for tid=%d after %d attempts; giving up",
+                    ack.telemetry_id, attempt,
+                )
+
         if disp & 0x80:
             failed_total = sum(c for d, c in self._ack_counts.items() if d & 0x80)
             log.warning(
@@ -325,16 +408,50 @@ class IpcTransport:
             return f"0x{ls:02X}"
 
     # -------------------------------------------------------------------------
-    # Transport protocol
+    # Submit helpers (rate-limited, retry-aware)
     # -------------------------------------------------------------------------
 
-    def emit(self, event: Event) -> None:
+    def _rate_limited_submit_telemetry(self, bytes_payload: bytes,
+                                       priority: Any) -> int:
+        """Wrap client.submit_telemetry() with a sliding-60s rate cap.
+
+        Sleeps until the oldest tracked submit ages out if the cap is at the
+        limit. Only invoked from the engine's tick/emit thread (and from
+        _drain_retry_queue which also runs there) -- never from the ACK
+        handler -- so no lock is needed on recent_submit_ts.
+        """
+        cap = self._max_submit_rate_per_min
+        if cap > 0:
+            now = time.monotonic()
+            cutoff = now - 60.0
+            while self._recent_submit_ts and self._recent_submit_ts[0] < cutoff:
+                self._recent_submit_ts.popleft()
+            if len(self._recent_submit_ts) >= cap:
+                sleep_until = self._recent_submit_ts[0] + 60.0
+                sleep_s = sleep_until - now
+                if sleep_s > 0:
+                    log.info(
+                        "rate-limit: pausing %.1fs (cap=%.0f/min, "
+                        "%d submits in last 60s)",
+                        sleep_s, cap, len(self._recent_submit_ts),
+                    )
+                    time.sleep(sleep_s)
+                    self._rate_limit_sleeps += 1
+                cutoff = time.monotonic() - 60.0
+                while self._recent_submit_ts and self._recent_submit_ts[0] < cutoff:
+                    self._recent_submit_ts.popleft()
+        tid = self._client.submit_telemetry(bytes_payload, priority=priority)
+        self._recent_submit_ts.append(time.monotonic())
+        return tid
+
+    def _pack_and_submit_event(self, event: Event) -> int:
+        """Pack an Event as SB45 and submit it. Records the original Event
+        in tid_to_payload so the ACK handler can re-queue on BUFFER_FULL."""
         location_status = (
             "DIRECT_EVENT_LOCATION"
             if event.gps_lat is not None and event.gps_lon is not None
             else "NO_LOCATION"
         )
-
         sb45_event = self._SB45Event(
             event_type=event.event_type,
             priority=event.priority,
@@ -350,21 +467,14 @@ class IpcTransport:
             anchor_lon=event.anchor_lon,
         )
         packed = self._pack_sb45(sb45_event)
-
         ipc_prio_name = self._PRIORITY_MAP.get(event.priority, "NORMAL")
         ipc_prio = getattr(self._Priority, ipc_prio_name)
+        return self._rate_limited_submit_telemetry(packed.bytes_payload, ipc_prio)
 
-        self._client.submit_telemetry(packed.bytes_payload, priority=ipc_prio)
-        self._count += 1
-
-    def emit_summary(self, summary: SummaryEvent) -> None:
-        """Pack a P1 batch summary via SB45_SIM_V3 (pack_sb45_summary) and
-        submit it as a TELEMETRY frame. pack_sb45_summary hard-codes the
-        SB45 priority field to BATCH_SUMMARY (=3) regardless of what we pass.
-        The IPC frame's own priority is ELEVATED (same as a P1 per-event)
-        because a summary REPRESENTS P1 events; we don't want the radio's
-        TX scheduler to de-prioritize it.
-        """
+    def _pack_and_submit_summary(self, summary: SummaryEvent) -> int:
+        """Pack a SummaryEvent as SB45_SIM_V3 summary and submit it. Records
+        the original SummaryEvent in tid_to_payload so the ACK handler can
+        re-queue on BUFFER_FULL."""
         sb45_summary = self._SB45Summary(
             event_type=summary.event_type,
             priority="BATCH_SUMMARY",
@@ -381,20 +491,81 @@ class IpcTransport:
         )
         packed = self._pack_sb45_summary(sb45_summary)
         ipc_prio = getattr(self._Priority, "ELEVATED")
-        self._client.submit_telemetry(packed.bytes_payload, priority=ipc_prio)
+        return self._rate_limited_submit_telemetry(packed.bytes_payload, ipc_prio)
+
+    def _drain_retry_queue(self) -> int:
+        """Re-submit any retry entries whose backoff has expired. Each retry
+        gets a NEW tid; the original tid stays in its terminal failed state.
+        Called from tick() so retry I/O happens on the engine's main thread
+        (never the ACK reader thread).
+
+        Returns the number of retries actually re-submitted on this call
+        (0 if nothing was due yet).
+        """
+        if self._max_retries <= 0:
+            return 0
+        now = time.monotonic()
+        # Snapshot under lock so the ACK handler can't append while we iterate.
+        with self._retry_queue_lock:
+            if not self._retry_queue:
+                return 0
+            due, not_due = [], []
+            for entry in self._retry_queue:
+                (due if entry[2] <= now else not_due).append(entry)
+            self._retry_queue[:] = not_due
+        n_submitted = 0
+        for kind, payload, _not_before, attempt in due:
+            if kind == "event":
+                new_tid = self._pack_and_submit_event(payload)
+            else:  # "summary"
+                new_tid = self._pack_and_submit_summary(payload)
+            self._tid_to_payload[new_tid] = (kind, payload)
+            self._tid_to_retry_count[new_tid] = attempt
+            self._retries_submitted += 1
+            self._count += 1
+            n_submitted += 1
+            log.info(
+                "retry submitted: kind=%s attempt=%d new_tid=%d",
+                kind, attempt, new_tid,
+            )
+        return n_submitted
+
+    # -------------------------------------------------------------------------
+    # Transport protocol
+    # -------------------------------------------------------------------------
+
+    def emit(self, event: Event) -> None:
+        tid = self._pack_and_submit_event(event)
+        if self._max_retries > 0:
+            self._tid_to_payload[tid] = ("event", event)
+            self._tid_to_retry_count[tid] = 0
+        self._count += 1
+
+    def emit_summary(self, summary: SummaryEvent) -> None:
+        """Pack a P1 batch summary via SB45_SIM_V3 (pack_sb45_summary) and
+        submit it as a TELEMETRY frame. pack_sb45_summary hard-codes the
+        SB45 priority field to BATCH_SUMMARY (=3) regardless of what we pass.
+        The IPC frame's own priority is ELEVATED (same as a P1 per-event)
+        because a summary REPRESENTS P1 events; we don't want the radio's
+        TX scheduler to de-prioritize it.
+        """
+        tid = self._pack_and_submit_summary(summary)
+        if self._max_retries > 0:
+            self._tid_to_payload[tid] = ("summary", summary)
+            self._tid_to_retry_count[tid] = 0
         self._count += 1
         log.info(
-            "emit_summary: type=%s window_end=%.0fs count=%d max=%.2f mean=%.2f",
-            summary.event_type, summary.window_end_elapsed_s,
+            "emit_summary: tid=%d type=%s window_end=%.0fs count=%d max=%.2f mean=%.2f",
+            tid, summary.event_type, summary.window_end_elapsed_s,
             summary.count, summary.max_score, summary.mean_score,
         )
 
     def tick(self, ts_epoch_s: float, elapsed_s: float) -> None:
-        """No-op for the IPC transport. The P1BatchingTransport calls this
-        on every wrapped transport to keep the interface uniform; the IPC
-        transport has no time-based bookkeeping of its own (the IPC client's
-        keep-alive runs on its own thread)."""
-        pass
+        """Per-frame pulse from the engine. Drains the retry queue (re-submits
+        any entries whose backoff has expired). When retries are disabled
+        (max_retries=0) this is a no-op, preserving the historical contract."""
+        if self._max_retries > 0:
+            self._drain_retry_queue()
 
     def close(self, drain_timeout_s: Optional[float] = None) -> None:
         """Drain pending submissions (best-effort), log summary, stop client.
