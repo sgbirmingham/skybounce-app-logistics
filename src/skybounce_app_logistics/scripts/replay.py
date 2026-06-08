@@ -105,17 +105,32 @@ def main() -> None:
                              "the default). Useful for sustained-load bench tests "
                              "and ACK-timing observation under realistic cadence.")
     parser.add_argument("--batch-p1", action="store_true",
-                        help="Wrap the transport in a P1BatchingTransport: "
-                             "every P1 event_type is accumulated over 5-min "
-                             "wall-clock-aligned windows and emitted as a "
-                             "single SB45_SIM_V3 summary frame per type per "
-                             "window. P2 events pass through unchanged. Useful "
-                             "to ease pressure on the radio's intake queue "
-                             "under high-density P1 traffic. Default off.")
-    parser.add_argument("--batch-window-s", type=float, default=300.0,
+                        help="Wrap the transport in a P1BatchingTransport: P1 "
+                             "events are accumulated over 30-min wall-clock-"
+                             "aligned windows and emitted as a single "
+                             "SB45_SIM_V4 per-window summary frame (per-type "
+                             "count buckets + coarse position). P2 events pass "
+                             "through unchanged (and are recorded in the "
+                             "summary's p2_present). Eases pressure on the "
+                             "radio's intake queue under high-density P1 "
+                             "traffic. Default off.")
+    parser.add_argument("--batch-window-s", type=float, default=1800.0,
                         metavar="SEC",
                         help="Window size in elapsed seconds for --batch-p1. "
-                             "Default 300 (5 min). Ignored without --batch-p1.")
+                             "Default 1800 (30 min, SB45_SIM_V4 -- sized by the "
+                             "2026-06-07 capacity sim). Ignored without "
+                             "--batch-p1.")
+    # Retry-on-0x80 was removed 2026-06-07 (radio team: retry adds churn
+    # without goodput at saturation). The proactive controls are V4 per-window
+    # batching (--batch-p1) and the submission rate cap below.
+    parser.add_argument("--max-submit-rate-per-min", type=float, default=0.0,
+                        metavar="N",
+                        help="--transport ipc only. Cap submissions to N per "
+                             "minute (sliding 60s window). Helps prevent "
+                             "BUFFER_FULL in the first place. 0 = unlimited. "
+                             "Suggested starting point: 30 (one submit per "
+                             "2 sec). Honors radio team's app-side "
+                             "rate-limiting request. Default: 0.")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
@@ -143,15 +158,17 @@ def main() -> None:
             transport = IpcTransport(
                 endpoint_id=args.endpoint_id,
                 socket_path=args.socket,
+                max_submit_rate_per_min=args.max_submit_rate_per_min,
             )
         except ImportError as e:
             parser.error(f"--transport ipc requires skybounce-ipc-python: {e}")
             return  # unreachable; parser.error exits
         out_descr = f"IPC endpoint_id=0x{args.endpoint_id:08X}"
 
-    # Optionally wrap with the P1 batcher. P2 / LOG events still flow through
-    # to the underlying transport untouched; P1 events get accumulated into
-    # per-type 5-min summaries.
+    # Optionally wrap with the P1 batcher. P2 events still flow through to the
+    # underlying transport; P1 events get accumulated into one SB45_SIM_V4
+    # per-window (30-min) summary frame. (LOG events are dropped at the IPC
+    # wire, so over IPC they never go OTA regardless of batching.)
     if args.batch_p1:
         from skybounce_app_logistics.p1_batcher import P1BatchingTransport
         transport = P1BatchingTransport(transport, window_s=args.batch_window_s)

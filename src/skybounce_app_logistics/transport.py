@@ -17,12 +17,13 @@ Both implement the same Transport protocol: emit(event) and close().
 
 from __future__ import annotations
 
+import collections
 import json
 import logging
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Optional, Protocol
+from typing import Any, Optional, Protocol
 
 
 log = logging.getLogger("skybounce.app.logistics.transport")
@@ -41,7 +42,7 @@ class Event:
     elapsed_s: float
     event_type: str
     score: float
-    priority: str               # "P2" | "P1" | "LOG"
+    priority: str               # "P2" | "P1" | "P0"
     event_class: str
     packet_rank: int
     policy_reason: str
@@ -66,25 +67,36 @@ class Event:
 
 @dataclass
 class SummaryEvent:
-    """One 5-minute per-type P1 window summary, ready for SB45_SIM_V3 packing.
+    """One per-window (15-min) P1 batch summary, ready for SB45_SIM_V4 packing.
 
     Produced by the P1BatchingTransport at window close; consumed by the
     underlying Transport's emit_summary(). The IPC transport packs this via
-    pack_sb45_summary; the file transport writes it as a marked JSON line.
+    pack_sb45_summary_v4; the file transport writes it as a marked JSON line.
 
-    `window_end_elapsed_s` is the elapsed-time of the window boundary that
-    just closed; the basestation reads this as the SB45 `elapsed_min_bin`.
+    One frame aggregates ALL P1 event types that fired in the window (V4
+    replaces V3's one-frame-per-type model).
 
-    `window_idx` is a per-event-type rolling 0..7 counter, advanced once each
-    time a summary is emitted for that type. Lets the basestation detect a
-    dropped window for type X.
+    Fields:
+        window_idx: 0..31, derived from the window position (gap-robust); the
+            basestation combines it with its clock to place the window in
+            absolute time.
+        code_counts: {event_type: count} for P1 events in the window. The IPC
+            transport maps these to fixed 2-bit count buckets (scheme B); only
+            P1-capable types have a slot.
+        max_score: peak severity over the window (P1 and P2), 0..1.
+        p2_present: True iff >=1 P2 event fired this window (P2s are sent
+            per-event, so this is the only summary-side record of one).
+        window_end_elapsed_s: elapsed-time of the window boundary that closed
+            (for logging / the file transport; not carried on the V4 wire).
+        last_gps_lat / last_gps_lon / last_location_status: last event's
+            position + fix status in the window.
+        anchor_lat / anchor_lon: session anchor (first valid fix).
     """
-    event_type: str
-    window_end_elapsed_s: float
     window_idx: int
-    count: int
+    code_counts: dict[str, int]
     max_score: float
-    mean_score: float
+    p2_present: bool
+    window_end_elapsed_s: float
     last_gps_lat: Optional[float]
     last_gps_lon: Optional[float]
     last_location_status: str
@@ -135,7 +147,7 @@ class FileTransport:
         lines from per-event lines (which have no `record_type` field today)."""
         record = asdict(summary)
         record["record_type"] = "summary"
-        record["sb45_layout_version"] = "SB45_SIM_V3"
+        record["sb45_layout_version"] = "SB45_SIM_V4"
         self._f.write(json.dumps(record, sort_keys=True) + "\n")
         self._f.flush()
         self._count += 1
@@ -177,10 +189,13 @@ class IpcTransport:
 
     # Map analyzer-style priority strings to IPC Priority enum values.
     # Centralized here so the mapping is one place to audit.
+    # App priority (P0/P1/P2) -> IPC Telemetry.priority enum (the radio's
+    # contract field). P2 events submit as CRITICAL so the bridge's preemption
+    # path (higher priority evicts lower) can act on them.
     _PRIORITY_MAP = {
         "P2": "CRITICAL",
         "P1": "ELEVATED",
-        "LOG": "NORMAL",
+        "P0": "NORMAL",
     }
 
     # Default close() drain budget. Long enough to absorb a burst-submit
@@ -193,7 +208,12 @@ class IpcTransport:
     # daemon round-trips so finer granularity buys nothing.
     _DRAIN_POLL_INTERVAL_S = 0.02
 
-    def __init__(self, endpoint_id: int, socket_path: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        endpoint_id: int,
+        socket_path: Optional[str] = None,
+        max_submit_rate_per_min: float = 0.0,
+    ) -> None:
         # Defer imports until construction so module imports cleanly without IPC.
         try:
             from skybounce_client import SkyBounceClient
@@ -201,7 +221,8 @@ class IpcTransport:
                 CmdResult, Disposition, LinkState, Priority,
             )
             from sb_telemetry_payload import (
-                SB45Event, SB45Summary, pack_sb45, pack_sb45_summary,
+                SB45Event, SB45SummaryV4, pack_sb45, pack_sb45_summary_v4,
+                SUMMARY_SLOT_OF_TYPE,
             )
         except ImportError as e:
             raise ImportError(
@@ -210,9 +231,10 @@ class IpcTransport:
             ) from e
 
         self._SB45Event = SB45Event
-        self._SB45Summary = SB45Summary
+        self._SB45SummaryV4 = SB45SummaryV4
         self._pack_sb45 = pack_sb45
-        self._pack_sb45_summary = pack_sb45_summary
+        self._pack_sb45_summary_v4 = pack_sb45_summary_v4
+        self._summary_slot_of_type = SUMMARY_SLOT_OF_TYPE
         self._Priority = Priority
         self._CmdResult = CmdResult
         self._Disposition = Disposition
@@ -223,8 +245,38 @@ class IpcTransport:
         # or a future operator endpoint).
         self._count = 0
         self._cmds_received = 0
+        self._p0_frames_skipped = 0
+        self._preempted_count = 0
         self._ack_counts: dict[int, int] = {}
         self._last_link_state: Optional[int] = None
+
+        # DROPPED_PREEMPTED: the radio team's preemption path sheds a
+        # lower-priority frame (in practice, one of our P1 summaries) to admit a
+        # higher-priority P2 into a full queue. That's expected under contention
+        # -- distinct from DROPPED_BUFFER_FULL (a real capacity stall). Resolved
+        # from the IPC Disposition enum so it auto-activates when the contract
+        # ships the code; None (and inert) until then. See the 2026-06-07
+        # preemption thread.
+        self._DROPPED_PREEMPTED = getattr(self._Disposition, "DROPPED_PREEMPTED", None)
+
+        # Retry-on-BUFFER_FULL was removed 2026-06-07: the radio team's finding
+        # is that re-submitting on 0x80 adds churn without goodput at
+        # saturation -- the retries are part of what overflows the intake
+        # queue. The correct response is to not overflow in the first place
+        # (proactive pacing/backpressure), which SB45_SIM_V4 per-window
+        # batching already achieves (steady-state offered load ~12/hr < the
+        # radio's ~15/hr service rate). A frame that still hits 0x80 is logged
+        # and counted as a terminal failure, not re-sent.
+
+        # Sliding-60s submission rate limit. Applies to every wire submission
+        # (emit, emit_summary). 0 = unlimited (existing behavior).
+        # When the cap is reached, _rate_limited_submit_telemetry sleeps until
+        # the oldest timestamp ages out. recent_submit_ts is only touched
+        # from the engine's tick/emit thread, never from the ACK handler,
+        # so no lock needed.
+        self._max_submit_rate_per_min = float(max_submit_rate_per_min)
+        self._recent_submit_ts: collections.deque = collections.deque()
+        self._rate_limit_sleeps = 0
 
         # Guard against double-close (drain timeout makes calling close()
         # twice expensive otherwise, and SkyBounceClient.stop() is not
@@ -240,7 +292,13 @@ class IpcTransport:
         self._client.set_status_handler(self._on_status)
 
         self._client.start()
-        log.info("IPC transport started, endpoint_id=0x%08X", endpoint_id)
+        log.info(
+            "IPC transport started, endpoint_id=0x%08X, rate_limit=%s/min "
+            "(retry-on-0x80 disabled)",
+            endpoint_id,
+            f"{self._max_submit_rate_per_min:.0f}"
+            if self._max_submit_rate_per_min > 0 else "unlimited",
+        )
 
     # -------------------------------------------------------------------------
     # Handlers
@@ -270,10 +328,27 @@ class IpcTransport:
         Per the v1.0 known limitations, DELIVERED is a hand-off confirmation,
         not an L1 ACK from the base station -- callers who care about that
         distinction should consult sensor_ipc_KNOWN_LIMITATIONS.md.
+
+        DROPPED_BUFFER_FULL (0x80) is a terminal failure here -- it is logged
+        and counted, not re-submitted (retry-on-0x80 was removed; see the
+        constructor note). DROPPED_PREEMPTED (if the contract defines it) is
+        also terminal, but logged at INFO and counted separately: it means a
+        higher-priority frame displaced this one, which is expected under
+        contention rather than a capacity stall.
         """
         disp = int(ack.disposition)
         self._ack_counts[disp] = self._ack_counts.get(disp, 0) + 1
         name = self._disposition_name(disp)
+
+        if self._DROPPED_PREEMPTED is not None and disp == self._DROPPED_PREEMPTED:
+            self._preempted_count += 1
+            log.info(
+                "TELEMETRY_ACK tid=%d disposition=%s reason=0x%04X "
+                "(shed for a higher-priority frame; expected under contention)",
+                ack.telemetry_id, name, ack.reason_code,
+            )
+            return
+
         if disp & 0x80:
             failed_total = sum(c for d, c in self._ack_counts.items() if d & 0x80)
             log.warning(
@@ -325,16 +400,48 @@ class IpcTransport:
             return f"0x{ls:02X}"
 
     # -------------------------------------------------------------------------
-    # Transport protocol
+    # Submit helpers (rate-limited)
     # -------------------------------------------------------------------------
 
-    def emit(self, event: Event) -> None:
+    def _rate_limited_submit_telemetry(self, bytes_payload: bytes,
+                                       priority: Any) -> int:
+        """Wrap client.submit_telemetry() with a sliding-60s rate cap.
+
+        Sleeps until the oldest tracked submit ages out if the cap is at the
+        limit. Only invoked from the engine's tick/emit thread, so no lock is
+        needed on recent_submit_ts.
+        """
+        cap = self._max_submit_rate_per_min
+        if cap > 0:
+            now = time.monotonic()
+            cutoff = now - 60.0
+            while self._recent_submit_ts and self._recent_submit_ts[0] < cutoff:
+                self._recent_submit_ts.popleft()
+            if len(self._recent_submit_ts) >= cap:
+                sleep_until = self._recent_submit_ts[0] + 60.0
+                sleep_s = sleep_until - now
+                if sleep_s > 0:
+                    log.info(
+                        "rate-limit: pausing %.1fs (cap=%.0f/min, "
+                        "%d submits in last 60s)",
+                        sleep_s, cap, len(self._recent_submit_ts),
+                    )
+                    time.sleep(sleep_s)
+                    self._rate_limit_sleeps += 1
+                cutoff = time.monotonic() - 60.0
+                while self._recent_submit_ts and self._recent_submit_ts[0] < cutoff:
+                    self._recent_submit_ts.popleft()
+        tid = self._client.submit_telemetry(bytes_payload, priority=priority)
+        self._recent_submit_ts.append(time.monotonic())
+        return tid
+
+    def _pack_and_submit_event(self, event: Event) -> int:
+        """Pack an Event as SB45 and submit it (rate-limited)."""
         location_status = (
             "DIRECT_EVENT_LOCATION"
             if event.gps_lat is not None and event.gps_lon is not None
             else "NO_LOCATION"
         )
-
         sb45_event = self._SB45Event(
             event_type=event.event_type,
             priority=event.priority,
@@ -350,50 +457,83 @@ class IpcTransport:
             anchor_lon=event.anchor_lon,
         )
         packed = self._pack_sb45(sb45_event)
-
         ipc_prio_name = self._PRIORITY_MAP.get(event.priority, "NORMAL")
         ipc_prio = getattr(self._Priority, ipc_prio_name)
+        return self._rate_limited_submit_telemetry(packed.bytes_payload, ipc_prio)
 
-        self._client.submit_telemetry(packed.bytes_payload, priority=ipc_prio)
-        self._count += 1
+    def _pack_and_submit_summary(self, summary: SummaryEvent) -> int:
+        """Pack a SummaryEvent as an SB45_SIM_V4 per-window summary and submit
+        it (rate-limited).
 
-    def emit_summary(self, summary: SummaryEvent) -> None:
-        """Pack a P1 batch summary via SB45_SIM_V3 (pack_sb45_summary) and
-        submit it as a TELEMETRY frame. pack_sb45_summary hard-codes the
-        SB45 priority field to BATCH_SUMMARY (=3) regardless of what we pass.
-        The IPC frame's own priority is ELEVATED (same as a P1 per-event)
-        because a summary REPRESENTS P1 events; we don't want the radio's
-        TX scheduler to de-prioritize it.
-        """
-        sb45_summary = self._SB45Summary(
-            event_type=summary.event_type,
-            priority="BATCH_SUMMARY",
-            location_status=summary.last_location_status,
+        code_counts is filtered to types that have a V4 summary slot; a
+        non-slottable (non-P1-capable) type would make pack_sb45_summary_v4
+        raise, which must not crash the wire path mid-drive, so we drop it with
+        a warning. In practice every P1 type the engine emits has a slot."""
+        slottable = {
+            t: c for t, c in summary.code_counts.items()
+            if t in self._summary_slot_of_type
+        }
+        dropped = set(summary.code_counts) - set(slottable)
+        if dropped:
+            log.warning(
+                "V4 summary: dropping non-slottable P1 type(s) %s from code_counts",
+                sorted(dropped),
+            )
+        sb45_summary = self._SB45SummaryV4(
             window_idx=summary.window_idx,
-            count=summary.count,
+            code_counts=slottable,
             max_score=summary.max_score,
-            mean_score=summary.mean_score,
-            window_end_elapsed_s=summary.window_end_elapsed_s,
+            location_status=summary.last_location_status,
+            p2_present=summary.p2_present,
             lat=summary.last_gps_lat,
             lon=summary.last_gps_lon,
             anchor_lat=summary.anchor_lat,
             anchor_lon=summary.anchor_lon,
         )
-        packed = self._pack_sb45_summary(sb45_summary)
+        packed = self._pack_sb45_summary_v4(sb45_summary)
         ipc_prio = getattr(self._Priority, "ELEVATED")
-        self._client.submit_telemetry(packed.bytes_payload, priority=ipc_prio)
+        return self._rate_limited_submit_telemetry(packed.bytes_payload, ipc_prio)
+
+    # -------------------------------------------------------------------------
+    # Transport protocol
+    # -------------------------------------------------------------------------
+
+    def emit(self, event: Event) -> None:
+        # P0 ("local-only context", formerly LOG/NORMAL) is NOT radioed -- it
+        # stays in the local stream only. Sending it consumed ~half the
+        # offered-load budget in the 2026-06-07 capacity sim, and node liveness
+        # is already covered by the IPC contract heartbeat, so P0 carries no
+        # signal worth the air-time. Only P1/P2 go OTA; the file transport still
+        # records P0 for forensics.
+        if event.priority == "P0":
+            self._p0_frames_skipped += 1
+            return
+        self._pack_and_submit_event(event)
+        self._count += 1
+
+    def emit_summary(self, summary: SummaryEvent) -> None:
+        """Pack a P1 per-window batch summary via SB45_SIM_V4
+        (pack_sb45_summary_v4) and submit it as a TELEMETRY frame.
+        pack_sb45_summary_v4 hard-codes the SB45 priority field to
+        BATCH_SUMMARY (=3); the IPC frame's own priority is ELEVATED (same as
+        a P1 per-event) because a summary REPRESENTS P1 events and we don't
+        want the radio's TX scheduler to de-prioritize it.
+        """
+        tid = self._pack_and_submit_summary(summary)
         self._count += 1
         log.info(
-            "emit_summary: type=%s window_end=%.0fs count=%d max=%.2f mean=%.2f",
-            summary.event_type, summary.window_end_elapsed_s,
-            summary.count, summary.max_score, summary.mean_score,
+            "emit_summary: tid=%d window_idx=%d window_end=%.0fs "
+            "p1_types=%d p1_total=%d max=%.2f p2_present=%s",
+            tid, summary.window_idx, summary.window_end_elapsed_s,
+            len(summary.code_counts), sum(summary.code_counts.values()),
+            summary.max_score, summary.p2_present,
         )
 
     def tick(self, ts_epoch_s: float, elapsed_s: float) -> None:
-        """No-op for the IPC transport. The P1BatchingTransport calls this
-        on every wrapped transport to keep the interface uniform; the IPC
-        transport has no time-based bookkeeping of its own (the IPC client's
-        keep-alive runs on its own thread)."""
+        """Per-frame pulse from the engine. No-op for the IPC transport: with
+        retry-on-0x80 removed there is no per-tick work to do here. Kept to
+        satisfy the Transport protocol (the P1 batcher calls tick() on its
+        wrapped transport)."""
         pass
 
     def close(self, drain_timeout_s: Optional[float] = None) -> None:
@@ -445,7 +585,10 @@ class IpcTransport:
                     drain_timeout_s, _terminal_count(), self._count, outstanding,
                 )
 
-        log.info("IPC transport closing, %d events submitted", self._count)
+        log.info(
+            "IPC transport closing, %d frames submitted, %d P0 frames "
+            "skipped (not radioed), %d preempted (shed for higher priority)",
+            self._count, self._p0_frames_skipped, self._preempted_count)
         if self._ack_counts:
             summary = ", ".join(
                 f"{self._disposition_name(d)}={c}"
@@ -472,3 +615,9 @@ class IpcTransport:
     @property
     def cmds_received(self) -> int:
         return self._cmds_received
+
+    @property
+    def preempted_count(self) -> int:
+        """Frames terminated by DROPPED_PREEMPTED (shed to admit a
+        higher-priority frame). 0 until the contract defines the code."""
+        return self._preempted_count
