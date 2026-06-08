@@ -216,10 +216,12 @@ class P1BatchingTransport:
 
         self._inner.tick(ts_epoch_s, elapsed_s)
 
-    def close(self) -> None:
+    def close(self, drain_timeout_s: Optional[float] = None) -> None:
         """Flush the open partial window if it saw any activity, then close
         inner. The summary's window_end_elapsed_s is the planned boundary even
-        though only a partial slice of the window ran."""
+        though only a partial slice of the window ran. drain_timeout_s is passed
+        through to the inner transport (<= 0 = drain until every frame is
+        terminal, so a backed-up radio queue isn't abandoned at close)."""
         if self._current_window_end_s is not None and self._window.any_activity:
             self._close_window(self._current_window_end_s)
         log.info(
@@ -227,7 +229,7 @@ class P1BatchingTransport:
             "summaries_emitted=%d",
             self._p1_events_seen, self._p2_events_seen, self._summaries_emitted,
         )
-        self._inner.close()
+        self._inner.close(drain_timeout_s)
 
     # -------------------------------------------------------------------------
     # Observability

@@ -45,8 +45,9 @@ class SpyTransport:
     def tick(self, ts_epoch_s: float, elapsed_s: float) -> None:
         self.ticks.append((ts_epoch_s, elapsed_s))
 
-    def close(self) -> None:
+    def close(self, drain_timeout_s=None) -> None:
         self.closed = True
+        self.close_drain_timeout_s = drain_timeout_s
 
 
 # -----------------------------------------------------------------------------

@@ -112,7 +112,7 @@ class Transport(Protocol):
     def emit(self, event: Event) -> None: ...
     def emit_summary(self, summary: SummaryEvent) -> None: ...
     def tick(self, ts_epoch_s: float, elapsed_s: float) -> None: ...
-    def close(self) -> None: ...
+    def close(self, drain_timeout_s: Optional[float] = None) -> None: ...
 
 
 # -----------------------------------------------------------------------------
@@ -158,7 +158,9 @@ class FileTransport:
         file transport has no time-based bookkeeping of its own."""
         pass
 
-    def close(self) -> None:
+    def close(self, drain_timeout_s: Optional[float] = None) -> None:
+        # drain_timeout_s is accepted for interface parity (the batcher forwards
+        # it); the file transport writes synchronously, so there's nothing to drain.
         log.info("file transport closing, %d records written to %s",
                  self._count, self._path)
         self._f.close()
@@ -577,6 +579,10 @@ class IpcTransport:
 
         if drain_timeout_s is None:
             drain_timeout_s = self._DEFAULT_CLOSE_DRAIN_TIMEOUT_S
+        # drain_timeout_s <= 0 means drain UNTIL every frame is terminal, with no
+        # deadline -- so a backed-up radio queue (drains at ~mu) isn't abandoned
+        # at socket close. Interruptible with Ctrl-C / SIGINT.
+        unlimited = drain_timeout_s <= 0
 
         if self._count > 0:
             delivered = int(self._Disposition.DELIVERED)
@@ -590,9 +596,19 @@ class IpcTransport:
                     if d == delivered or (d & 0x80)
                 )
 
-            deadline = time.monotonic() + drain_timeout_s
-            while _terminal_count() < self._count and time.monotonic() < deadline:
+            deadline = None if unlimited else time.monotonic() + drain_timeout_s
+            next_progress = time.monotonic() + 30.0
+            while _terminal_count() < self._count and (
+                deadline is None or time.monotonic() < deadline
+            ):
                 time.sleep(self._DRAIN_POLL_INTERVAL_S)
+                if unlimited and time.monotonic() >= next_progress:
+                    log.info(
+                        "IPC transport draining: %d/%d frames terminal -- waiting "
+                        "for the radio to deliver its backlog (Ctrl-C to stop)",
+                        _terminal_count(), self._count,
+                    )
+                    next_progress = time.monotonic() + 30.0
 
             outstanding = self._count - _terminal_count()
             if outstanding > 0:

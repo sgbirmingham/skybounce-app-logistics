@@ -129,6 +129,13 @@ def main() -> None:
                              "45). Lower it (e.g. 2) to let a tight burst of "
                              "severe_impacts fire on one node for stress tests. "
                              "Test-only knob.")
+    parser.add_argument("--drain-timeout-s", type=float, default=0.0,
+                        metavar="SEC",
+                        help="At close, wait this long for every submitted frame "
+                             "to reach a terminal disposition before tearing down "
+                             "the socket. 0 (default) = UNLIMITED -- drain until "
+                             "the radio has delivered the whole backlog (Ctrl-C to "
+                             "stop). Set >0 to bound it (the old 5s behaviour: 5).")
     parser.add_argument("--max-submit-rate-per-min", type=float, default=0.0,
                         metavar="N",
                         help="--transport ipc only. Cap submissions to N per "
@@ -200,7 +207,7 @@ def main() -> None:
     try:
         run_engine(frames, transport=transport, cfg=cfg)
     finally:
-        transport.close()
+        transport.close(drain_timeout_s=args.drain_timeout_s)
 
     # event_count is exposed by FileTransport but not by every Transport (IPC,
     # batched wrappers). hasattr keeps this summary line useful when present
