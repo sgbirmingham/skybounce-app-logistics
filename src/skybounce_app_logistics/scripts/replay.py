@@ -129,6 +129,17 @@ def main() -> None:
                              "45). Lower it (e.g. 2) to let a tight burst of "
                              "severe_impacts fire on one node for stress tests. "
                              "Test-only knob.")
+    parser.add_argument("--severe-impact-g", type=float, default=None,
+                        metavar="G",
+                        help="Override AnalyzerConfig.severe_impact_g (default "
+                             "0.45). TEST-ONLY: lower it (e.g. 0.45) to let a real "
+                             "drive's road bumps register as P2 for exercising the "
+                             "safety path -- do NOT lower it in production (real "
+                             "driving tops out ~1g; a crash is 10g+).")
+    parser.add_argument("--severe-jerk-g-s", type=float, default=None,
+                        metavar="GS",
+                        help="Override AnalyzerConfig.severe_jerk_g_s (default 1.0). "
+                             "Test-only companion to --severe-impact-g.")
     parser.add_argument("--drain-timeout-s", type=float, default=0.0,
                         metavar="SEC",
                         help="At close, wait this long for every submitted frame "
@@ -199,8 +210,12 @@ def main() -> None:
     else:
         print(f"Rate:      burst (as-fast-as-possible)")
 
-    cfg = (AnalyzerConfig(impact_cooldown_s=args.impact_cooldown_s)
-           if args.impact_cooldown_s is not None else AnalyzerConfig())
+    _cfg_overrides = {k: v for k, v in {
+        "impact_cooldown_s": args.impact_cooldown_s,
+        "severe_impact_g": args.severe_impact_g,
+        "severe_jerk_g_s": args.severe_jerk_g_s,
+    }.items() if v is not None}
+    cfg = AnalyzerConfig(**_cfg_overrides)
     frames = batch_frames(args.input)
     if args.rate is not None:
         frames = _pace_frames(frames, args.rate)
