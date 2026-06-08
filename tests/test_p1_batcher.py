@@ -9,7 +9,7 @@ Covers the per-WINDOW V4 model:
 - A window closes at elapsed_s >= boundary; ONE summary per window aggregates
   all P1 types into code_counts.
 - max_score is the window peak (over P1 and P2).
-- window_idx is derived from window position (mod 32), gap-robust.
+- window_idx is derived from window position (mod 4, 2-bit), gap-robust.
 - emit_empty_windows: True emits empty windows (gapless idx); False skips them.
 - close() flushes an open partial window iff it saw activity.
 - Multiple boundaries crossed in one tick still emit each window in order.
@@ -190,7 +190,7 @@ def test_empty_window_emits_by_default():
     s = spy.summaries[0]
     assert s.code_counts == {}
     assert s.p2_present is False
-    assert s.window_idx == 1            # round(300/300) % 32
+    assert s.window_idx == 1            # round(300/300) % 4
 
 
 def test_empty_window_skipped_when_disabled():
@@ -201,7 +201,7 @@ def test_empty_window_skipped_when_disabled():
 
 
 # -----------------------------------------------------------------------------
-# window_idx: derived from position, gap-robust, wraps mod 32
+# window_idx: derived from position, gap-robust, wraps mod 4 (2-bit)
 # -----------------------------------------------------------------------------
 
 def test_window_idx_derived_from_position():
@@ -213,21 +213,22 @@ def test_window_idx_derived_from_position():
             elapsed_s=(w - 1) * 300.0 + 10.0,
         ))
         batcher.tick(ts_epoch_s=0, elapsed_s=w * 300.0)
-    assert [s.window_idx for s in spy.summaries] == [1, 2, 3, 4, 5]
+    # 2-bit window_idx: window number mod 4.
+    assert [s.window_idx for s in spy.summaries] == [1, 2, 3, 0, 1]
 
 
-def test_window_idx_wraps_mod_32():
+def test_window_idx_wraps_mod_4():
     spy = SpyTransport()
     batcher = _batcher_no_empties(spy, window_s=300.0)
-    # Window ending at 32*300 = 9600 -> idx 0; 33*300 = 9900 -> idx 1.
+    # Window ending at 4*300 = 1200 -> idx 0; 5*300 = 1500 -> idx 1.
     batcher.emit(make_event(
-        event_type="moderate_impact", priority="P1", elapsed_s=9600.0 - 10.0,
+        event_type="moderate_impact", priority="P1", elapsed_s=1200.0 - 10.0,
     ))
-    batcher.tick(ts_epoch_s=0, elapsed_s=9600.0)
+    batcher.tick(ts_epoch_s=0, elapsed_s=1200.0)
     batcher.emit(make_event(
-        event_type="moderate_impact", priority="P1", elapsed_s=9900.0 - 10.0,
+        event_type="moderate_impact", priority="P1", elapsed_s=1500.0 - 10.0,
     ))
-    batcher.tick(ts_epoch_s=0, elapsed_s=9900.0)
+    batcher.tick(ts_epoch_s=0, elapsed_s=1500.0)
     assert [s.window_idx for s in spy.summaries] == [0, 1]
 
 
@@ -246,7 +247,9 @@ def test_window_idx_gap_robust_when_skipping_empties():
         event_type="moderate_impact", priority="P1", elapsed_s=910.0,
     ))
     batcher.tick(ts_epoch_s=0, elapsed_s=1200.0)
-    assert [s.window_idx for s in spy.summaries] == [1, 4]
+    # window 1 -> idx 1; window 4 -> idx 0 (mod 4). The gap (1 then 0, skipping
+    # 2 and 3) is real, not an artifact of skipping.
+    assert [s.window_idx for s in spy.summaries] == [1, 0]
 
 
 # -----------------------------------------------------------------------------

@@ -32,10 +32,12 @@ Design (SB45_SIM_V4)
   a marked JSON line.
 
 - window_idx: 0..31, DERIVED from the window position
-  (`round(window_end_s / window_s) mod 32`), not a free-running counter. This
+  (`round(window_end_s / window_s) mod 4`), not a free-running counter. This
   makes it gap-robust -- a paused engine that resumes still tags each window
-  with the index the basestation expects for that elapsed time. 5-bit width
-  wraps every 32 windows = 16h at 30-min windows (option C; see the IPC repo's
+  with the index the basestation expects for that elapsed time. 2-bit width
+  wraps every 4 windows = 2h at 30-min windows -- a dedup/ordering/gap
+  cross-check, since absolute window time now comes from the Pi-side emission
+  timestamp in the IPC envelope (see the IPC repo's
   sb45_v4_window_idx_decision_2026-06-07.md).
 
 - emit_empty_windows (default True): emit a summary for every crossed boundary
@@ -80,7 +82,7 @@ DEFAULT_WINDOW_S = 1800.0  # 30 minutes (SB45_SIM_V4). Chosen from the
                            # 2026-06-07 capacity sim: 15-min windows put 3
                            # nodes over mu=15/hr; 30-min lands at mu (with P0
                            # dropped at the IPC wire). See the findings doc.
-WINDOW_IDX_MODULUS = 32    # 5-bit window_idx; wraps every 32 windows (16h @ 30min)
+WINDOW_IDX_MODULUS = 4     # 2-bit window_idx; wraps every 4 windows (2h @ 30min)
 
 
 @dataclass
@@ -275,7 +277,7 @@ class P1BatchingTransport:
 
     def _window_idx_for(self, window_end_s: float) -> int:
         """Window index derived from elapsed position: the count of completed
-        windows at window_end_s, mod 32. Gap-robust (independent of how many
+        windows at window_end_s, mod 4. Gap-robust (independent of how many
         windows actually emitted) so it maps cleanly to absolute time."""
         return int(round(window_end_s / self._window_s)) % WINDOW_IDX_MODULUS
 
