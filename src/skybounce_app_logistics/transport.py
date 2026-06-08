@@ -221,7 +221,8 @@ class IpcTransport:
                 CmdResult, Disposition, LinkState, Priority,
             )
             from sb_telemetry_payload import (
-                SB45Event, SB45SummaryV4, pack_sb45, pack_sb45_summary_v4,
+                SB45Event, SB45SummaryV4, SB45PrecisePosition,
+                pack_sb45, pack_sb45_summary_v4, pack_sb45_precise,
                 SUMMARY_SLOT_OF_TYPE,
             )
         except ImportError as e:
@@ -232,8 +233,10 @@ class IpcTransport:
 
         self._SB45Event = SB45Event
         self._SB45SummaryV4 = SB45SummaryV4
+        self._SB45PrecisePosition = SB45PrecisePosition
         self._pack_sb45 = pack_sb45
         self._pack_sb45_summary_v4 = pack_sb45_summary_v4
+        self._pack_sb45_precise = pack_sb45_precise
         self._summary_slot_of_type = SUMMARY_SLOT_OF_TYPE
         self._Priority = Priority
         self._CmdResult = CmdResult
@@ -246,6 +249,7 @@ class IpcTransport:
         self._count = 0
         self._cmds_received = 0
         self._p0_frames_skipped = 0
+        self._precise_frames_sent = 0
         self._preempted_count = 0
         self._ack_counts: dict[int, int] = {}
         self._last_link_state: Optional[int] = None
@@ -510,6 +514,20 @@ class IpcTransport:
             return
         self._pack_and_submit_event(event)
         self._count += 1
+        # P2 (severe_impact) gets a companion precise-position frame for
+        # real-time crash dispatch (region-absolute ~62 m). Parked/session-start
+        # precise position is forensic (on-Pi log), not radioed -- so the on-wire
+        # precise trigger is P2 only. See the V4 decision doc, Addendum 3.
+        if event.priority == "P2" and event.gps_lat is not None \
+                and event.gps_lon is not None:
+            packed = self._pack_sb45_precise(
+                self._SB45PrecisePosition(lat=event.gps_lat, lon=event.gps_lon)
+            )
+            # CRITICAL like the P2 it locates, so preemption protects it too.
+            self._rate_limited_submit_telemetry(
+                packed.bytes_payload, getattr(self._Priority, "CRITICAL"))
+            self._precise_frames_sent += 1
+            self._count += 1
 
     def emit_summary(self, summary: SummaryEvent) -> None:
         """Pack a P1 per-window batch summary via SB45_SIM_V4
