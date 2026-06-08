@@ -123,6 +123,12 @@ def main() -> None:
     # Retry-on-0x80 was removed 2026-06-07 (radio team: retry adds churn
     # without goodput at saturation). The proactive controls are V4 per-window
     # batching (--batch-p1) and the submission rate cap below.
+    parser.add_argument("--impact-cooldown-s", type=float, default=None,
+                        metavar="SEC",
+                        help="Override AnalyzerConfig.impact_cooldown_s (default "
+                             "45). Lower it (e.g. 2) to let a tight burst of "
+                             "severe_impacts fire on one node for stress tests. "
+                             "Test-only knob.")
     parser.add_argument("--max-submit-rate-per-min", type=float, default=0.0,
                         metavar="N",
                         help="--transport ipc only. Cap submissions to N per "
@@ -186,7 +192,8 @@ def main() -> None:
     else:
         print(f"Rate:      burst (as-fast-as-possible)")
 
-    cfg = AnalyzerConfig()
+    cfg = (AnalyzerConfig(impact_cooldown_s=args.impact_cooldown_s)
+           if args.impact_cooldown_s is not None else AnalyzerConfig())
     frames = batch_frames(args.input)
     if args.rate is not None:
         frames = _pace_frames(frames, args.rate)
