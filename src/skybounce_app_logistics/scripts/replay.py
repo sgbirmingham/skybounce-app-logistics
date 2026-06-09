@@ -230,8 +230,8 @@ def main() -> None:
     if hasattr(transport, "event_count"):
         print(f"Records emitted: {transport.event_count}")
     if hasattr(transport, "summaries_emitted"):
-        print(f"  of which summaries: {transport.summaries_emitted}")
-        print(f"  P1 events absorbed into summaries: {transport.p1_events_seen}")
+        print(f"  summary frames: {transport.summaries_emitted} "
+              f"(absorbing {transport.p1_events_seen} P1 events)")
 
 
 if __name__ == "__main__":
