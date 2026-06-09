@@ -241,7 +241,12 @@ class StreamingEngine:
         t = feats.ts_epoch_s
         cfg = self.cfg
 
-        # Severe impact
+        # Severe impact -- the g/jerk gate is only a CANDIDATE. A real crash
+        # collapses speed; a hard bump (the old 0.45g threshold's false positives)
+        # doesn't. Resolve any prior candidate first, then hold a new one for
+        # speed-collapse confirmation instead of emitting immediately.
+        self._resolve_pending_severe(feats, t)
+
         fired, score, detail = is_severe_impact(
             lin_accel_g=feats.lin_accel_g,
             jerk_g_s=feats.jerk_g_s,
@@ -249,9 +254,12 @@ class StreamingEngine:
             gps_speed_m_s=feats.speed_m_s,
             cfg=cfg,
         )
-        if fired and cooldown_ok(self.state.last_event_ts, "severe_impact", t, cfg.impact_cooldown_s):
-            self._emit_event(feats, "severe_impact", score, detail)
-            return  # mirror analyzer's `continue`
+        if fired and self.state.pending_severe is None:
+            self.state.pending_severe = {
+                "ts": t, "speed": feats.speed_m_s,
+                "score": score, "detail": detail, "feats": feats,
+            }
+            return  # candidate preempts this frame's other point events
 
         # Moderate impact
         fired, score, detail = is_moderate_impact(
@@ -281,6 +289,38 @@ class StreamingEngine:
         )
         if fired and cooldown_ok(self.state.last_event_ts, "hard_accel", t, cfg.accel_event_cooldown_s):
             self._emit_event(feats, "hard_accel", score, detail)
+
+    def _resolve_pending_severe(self, feats: ComputedFeatures, t: float) -> None:
+        """Confirm or expire a held severe-impact candidate.
+
+        A real crash sheds speed fast; a hard bump doesn't. If speed has dropped
+        by >= severe_impact_speed_drop_m_s since the candidate fired, emit
+        severe_impact (P2, stamped at the impact frame). If the confirmation
+        window elapses with no collapse, the candidate was a bump -> emit it as
+        moderate_impact instead, so it's still recorded.
+        """
+        p = self.state.pending_severe
+        if p is None:
+            return
+        cfg = self.cfg
+        cur = feats.speed_m_s
+        if cur is not None and (p["speed"] - cur) >= cfg.severe_impact_speed_drop_m_s:
+            self.state.pending_severe = None
+            if cooldown_ok(self.state.last_event_ts, "severe_impact", p["ts"], cfg.impact_cooldown_s):
+                detail = f'{p["detail"]}, speed_drop={p["speed"] - cur:.1f} m/s (crash confirmed)'
+                self._emit_event(p["feats"], "severe_impact", p["score"], detail)
+            return
+        if (t - p["ts"]) > cfg.severe_impact_confirm_window_s:
+            self.state.pending_severe = None
+            fired, score, detail = is_moderate_impact(
+                lin_accel_g=p["feats"].lin_accel_g,
+                jerk_g_s=p["feats"].jerk_g_s,
+                gps_confidence=p["feats"].gps_confidence,
+                gps_speed_m_s=p["feats"].speed_m_s,
+                cfg=cfg,
+            )
+            if fired and cooldown_ok(self.state.last_event_ts, "moderate_impact", p["ts"], cfg.impact_cooldown_s):
+                self._emit_event(p["feats"], "moderate_impact", score, detail)
 
     # -------------------------------------------------------------------------
     # State / trip / stop / GPS episode tracking

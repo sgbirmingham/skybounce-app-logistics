@@ -117,6 +117,12 @@ class StreamingState:
     # Cooldown timestamps per event type
     last_event_ts: dict = field(default_factory=dict)
 
+    # A severe-impact CANDIDATE (g/jerk gate passed) awaiting post-impact
+    # speed-collapse confirmation. dict: {ts, speed, score, detail, feats}.
+    # Confirmed -> severe_impact (P2); window expires without collapse ->
+    # moderate_impact (it was a hard bump, not a crash).
+    pending_severe: Optional[dict] = None
+
 
 def _is_good_fix(frame: SensorFrame, cfg: AnalyzerConfig) -> bool:
     """Mirror analyzer's gps_good_fix criterion."""
