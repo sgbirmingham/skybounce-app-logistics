@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Iterator
@@ -80,6 +81,15 @@ def _pace_frames(frames: Iterator[SensorFrame], rate: float) -> Iterator[SensorF
 DEFAULT_ENDPOINT_ID = 0x53415050
 
 
+def _default_endpoint_id() -> int:
+    """Per-device endpoint id: $SKYBOUNCE_ENDPOINT_ID (decimal / 0x / 0o) if set,
+    else the shared placeholder. Each Pi in a fleet MUST set a unique value
+    (e.g. in its shell profile) so the basestation can route/dispatch per
+    vehicle -- a shared id misroutes ACKs and starves nodes under load."""
+    v = os.environ.get("SKYBOUNCE_ENDPOINT_ID")
+    return int(v, 0) if v else DEFAULT_ENDPOINT_ID
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Replay a logger CSV through the streaming engine.")
     parser.add_argument("--input", required=True, type=Path,
@@ -95,9 +105,11 @@ def main() -> None:
                         help="Unix socket path for --transport ipc. Overrides "
                              "$SKYBOUNCE_SENSOR_SOCK; library default if unset.")
     parser.add_argument("--endpoint-id", type=lambda x: int(x, 0),
-                        default=DEFAULT_ENDPOINT_ID,
+                        default=_default_endpoint_id(),
                         help="32-bit endpoint identifier sent in HELLO "
-                             "(--transport ipc only). Decimal, 0x hex, or 0o octal.")
+                             "(--transport ipc only). Defaults to "
+                             "$SKYBOUNCE_ENDPOINT_ID if set, else the shared "
+                             "placeholder. Decimal, 0x hex, or 0o octal.")
     parser.add_argument("--rate", type=float, default=None, metavar="N",
                         help="Pace yields at N x real-time of the row timestamps "
                              "(1.0 = real-time, 10.0 = 10x faster). Omit for "
