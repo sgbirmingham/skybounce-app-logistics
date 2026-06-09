@@ -115,6 +115,8 @@ class MockSkyBounce:
         self._conn: socket.socket | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self.buffer_full_count = 0
+        self._buffer_full_remaining = 0
 
     # ---- lifecycle -----------------------------------------------------------
 
@@ -187,6 +189,11 @@ class MockSkyBounce:
     def inject_ping(self, token: int) -> None:
         self._send(MsgType.PING, PingPong(token=token).pack())
 
+    def set_buffer_full(self, count: int) -> None:
+        """Make the next `count` TELEMETRY submissions respond with
+        DROPPED_BUFFER_FULL instead of QUEUED+DELIVERED."""
+        self._buffer_full_remaining = count
+
     # ---- session loop --------------------------------------------------------
 
     def _serve(self) -> None:
@@ -241,8 +248,18 @@ class MockSkyBounce:
         if msg_type == MsgType.TELEMETRY:
             tel = Telemetry.unpack(payload)
             self.received_telemetry.append(tel)
-            # ACK with QUEUED then DELIVERED; small spacing so the client
-            # logs them as discrete events.
+            if self._buffer_full_remaining > 0:
+                self._buffer_full_remaining -= 1
+                self.buffer_full_count += 1
+                self._send(
+                    MsgType.TELEMETRY_ACK,
+                    TelemetryAck(
+                        telemetry_id=tel.telemetry_id,
+                        disposition=int(Disposition.DROPPED_BUFFER_FULL),
+                        reason_code=0x0002,
+                    ).pack(),
+                )
+                return
             for disp in (Disposition.QUEUED, Disposition.DELIVERED):
                 self._send(
                     MsgType.TELEMETRY_ACK,
@@ -428,4 +445,44 @@ def test_close_drains_pending_telemetry(loopback):
     assert transport.ack_counts.get(delivered, 0) == N, (
         f"expected {N} DELIVERED ACKs accounted for in transport; "
         f"got ack_counts={transport.ack_counts}"
+    )
+
+
+def test_p2_resubmit_on_buffer_full(loopback):
+    """A CRITICAL (P2) frame that gets DROPPED_BUFFER_FULL is automatically
+    resubmitted by the transport's P2 resubmit thread. The mock rejects the
+    first submission with BUFFER_FULL, then accepts the resubmit with
+    QUEUED+DELIVERED. The event data and priority make it CRITICAL (P2), so
+    the resubmit path fires.
+
+    Validates: unbounded P2 resubmit (transport._resubmit_count > 0,
+    the frame ultimately DELIVERED).
+    """
+    transport, mock = loopback
+    # First P2 event submission → BUFFER_FULL; next submission (the
+    # resubmit) → normal QUEUED+DELIVERED.  The P2 event also emits a
+    # precise-position companion (also CRITICAL), so set buffer_full to 2
+    # to reject both the event AND the precise frame on first try.
+    mock.set_buffer_full(2)
+    transport.emit(_make_event())  # P2 with gps → event + precise = 2 frames
+
+    # Wait for the resubmit thread to re-submit and the mock to DELIVER.
+    assert _wait_until(
+        lambda: transport._resubmit_count >= 2, timeout_s=5.0
+    ), (
+        f"expected >=2 resubmissions; got {transport._resubmit_count} "
+        f"(ack_counts={transport.ack_counts})"
+    )
+    # Both the original attempt and the resubmit arrive on the mock side.
+    # Original: 2 frames (rejected). Resubmit: 2 frames (accepted).
+    assert len(mock.received_telemetry) >= 4, (
+        f"expected >=4 TELEMETRY frames (2 rejected + 2 resubmitted); "
+        f"got {len(mock.received_telemetry)}"
+    )
+    delivered = int(Disposition.DELIVERED)
+    assert _wait_until(
+        lambda: transport.ack_counts.get(delivered, 0) >= 2, timeout_s=3.0
+    ), (
+        f"resubmitted frames should reach DELIVERED; "
+        f"ack_counts={transport.ack_counts}"
     )

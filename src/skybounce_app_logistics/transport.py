@@ -20,6 +20,7 @@ from __future__ import annotations
 import collections
 import json
 import logging
+import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -284,6 +285,24 @@ class IpcTransport:
         self._recent_submit_ts: collections.deque = collections.deque()
         self._rate_limit_sleeps = 0
 
+        # P2 resubmit: when a CRITICAL-priority frame (P2 event or precise-
+        # position) gets DROPPED_BUFFER_FULL, re-submit it until delivered.
+        # The resubmit thread wakes on _resubmit_ready, pops one entry,
+        # waits an exponential backoff (1s, 2s, 4s, ... capped at 30s),
+        # and re-submits.  No attempt limit — P2 crash frames keep trying
+        # until they get through or the transport closes.
+        self._P2_RESUBMIT_INITIAL_BACKOFF_S = 1.0
+        self._P2_RESUBMIT_MAX_BACKOFF_S = 30.0
+        self._p2_pending: dict[int, tuple[bytes, Any, int]] = {}
+        self._p2_pending_lock = threading.Lock()
+        self._resubmit_queue: list[tuple[bytes, Any, int]] = []
+        self._resubmit_lock = threading.Lock()
+        self._resubmit_ready = threading.Event()
+        self._resubmit_count = 0
+        self._resubmit_inflight = 0
+        self._resubmit_inflight_lock = threading.Lock()
+        self._resubmit_stop = threading.Event()
+
         # Guard against double-close (drain timeout makes calling close()
         # twice expensive otherwise, and SkyBounceClient.stop() is not
         # documented as idempotent).
@@ -298,12 +317,19 @@ class IpcTransport:
         self._client.set_status_handler(self._on_status)
 
         self._client.start()
+
+        self._resubmit_thread = threading.Thread(
+            target=self._resubmit_loop, daemon=True, name="p2-resubmit")
+        self._resubmit_thread.start()
+
         log.info(
             "IPC transport started, endpoint_id=0x%08X, rate_limit=%s/min "
-            "(retry-on-0x80 disabled)",
+            "(P2 resubmit: unlimited, backoff %.1fs-%.1fs)",
             endpoint_id,
             f"{self._max_submit_rate_per_min:.0f}"
             if self._max_submit_rate_per_min > 0 else "unlimited",
+            self._P2_RESUBMIT_INITIAL_BACKOFF_S,
+            self._P2_RESUBMIT_MAX_BACKOFF_S,
         )
 
     # -------------------------------------------------------------------------
@@ -331,41 +357,56 @@ class IpcTransport:
 
         Terminal failures (high bit set per spec Section 7.4) log at WARNING
         with a running failure total; non-terminal dispositions log at INFO.
-        Per the v1.0 known limitations, DELIVERED is a hand-off confirmation,
-        not an L1 ACK from the base station -- callers who care about that
-        distinction should consult sensor_ipc_KNOWN_LIMITATIONS.md.
 
-        DROPPED_BUFFER_FULL (0x80) is a terminal failure here -- it is logged
-        and counted, not re-submitted (retry-on-0x80 was removed; see the
-        constructor note). DROPPED_PREEMPTED (if the contract defines it) is
-        also terminal, but logged at INFO and counted separately: it means a
-        higher-priority frame displaced this one, which is expected under
-        contention rather than a capacity stall.
+        DROPPED_BUFFER_FULL (0x80) on a CRITICAL frame (P2/precise) is
+        intercepted for resubmit -- the payload is queued for retry until
+        delivered. Non-CRITICAL 0x80s remain terminal failures.
         """
         disp = int(ack.disposition)
         self._ack_counts[disp] = self._ack_counts.get(disp, 0) + 1
         name = self._disposition_name(disp)
+        tid = ack.telemetry_id
 
         if self._DROPPED_PREEMPTED is not None and disp == self._DROPPED_PREEMPTED:
             self._preempted_count += 1
+            with self._p2_pending_lock:
+                self._p2_pending.pop(tid, None)
             log.info(
                 "TELEMETRY_ACK tid=%d disposition=%s reason=0x%04X "
                 "(shed for a higher-priority frame; expected under contention)",
-                ack.telemetry_id, name, ack.reason_code,
+                tid, name, ack.reason_code,
             )
             return
 
         if disp & 0x80:
-            failed_total = sum(c for d, c in self._ack_counts.items() if d & 0x80)
-            log.warning(
-                "TELEMETRY_ACK tid=%d disposition=%s reason=0x%04X "
-                "(failures so far: %d)",
-                ack.telemetry_id, name, ack.reason_code, failed_total,
-            )
+            with self._p2_pending_lock:
+                entry = self._p2_pending.pop(tid, None)
+            if entry is not None and disp == int(self._Disposition.DROPPED_BUFFER_FULL):
+                payload, priority, attempt = entry
+                log.info(
+                    "TELEMETRY_ACK tid=%d BUFFER_FULL on CRITICAL frame "
+                    "(attempt %d) -- queuing for resubmit",
+                    tid, attempt,
+                )
+                with self._resubmit_lock:
+                    self._resubmit_queue.append((payload, priority, attempt + 1))
+                self._resubmit_ready.set()
+                self._count -= 1
+                return
+            else:
+                failed_total = sum(c for d, c in self._ack_counts.items() if d & 0x80)
+                log.warning(
+                    "TELEMETRY_ACK tid=%d disposition=%s reason=0x%04X "
+                    "(failures so far: %d)",
+                    tid, name, ack.reason_code, failed_total,
+                )
         else:
+            if disp == int(self._Disposition.DELIVERED):
+                with self._p2_pending_lock:
+                    self._p2_pending.pop(tid, None)
             log.info(
                 "TELEMETRY_ACK tid=%d disposition=%s reason=0x%04X",
-                ack.telemetry_id, name, ack.reason_code,
+                tid, name, ack.reason_code,
             )
 
     def _on_status(self, status) -> None:
@@ -406,16 +447,55 @@ class IpcTransport:
             return f"0x{ls:02X}"
 
     # -------------------------------------------------------------------------
+    # P2 resubmit loop (background thread)
+    # -------------------------------------------------------------------------
+
+    def _resubmit_loop(self) -> None:
+        """Pop rejected CRITICAL frames from _resubmit_queue and re-submit
+        them after an exponential backoff. Runs on a daemon thread; exits
+        when _resubmit_stop is set and queue + inflight are both empty."""
+        while True:
+            self._resubmit_ready.wait(timeout=0.5)
+            if self._resubmit_stop.is_set():
+                with self._resubmit_lock:
+                    if not self._resubmit_queue:
+                        return
+            with self._resubmit_lock:
+                if not self._resubmit_queue:
+                    self._resubmit_ready.clear()
+                    if self._resubmit_stop.is_set():
+                        return
+                    continue
+                payload, priority, attempt = self._resubmit_queue.pop(0)
+            with self._resubmit_inflight_lock:
+                self._resubmit_inflight += 1
+            backoff = min(
+                self._P2_RESUBMIT_INITIAL_BACKOFF_S * (2 ** (attempt - 1)) if attempt > 0 else self._P2_RESUBMIT_INITIAL_BACKOFF_S,
+                self._P2_RESUBMIT_MAX_BACKOFF_S,
+            )
+            time.sleep(backoff)
+            tid = self._rate_limited_submit_telemetry(
+                payload, priority, _resubmit_attempt=attempt)
+            self._count += 1
+            self._resubmit_count += 1
+            with self._resubmit_inflight_lock:
+                self._resubmit_inflight -= 1
+            log.info(
+                "P2 resubmit: tid=%d attempt=%d backoff=%.1fs",
+                tid, attempt, backoff,
+            )
+
+    # -------------------------------------------------------------------------
     # Submit helpers (rate-limited)
     # -------------------------------------------------------------------------
 
     def _rate_limited_submit_telemetry(self, bytes_payload: bytes,
-                                       priority: Any) -> int:
+                                       priority: Any,
+                                       _resubmit_attempt: int = 0) -> int:
         """Wrap client.submit_telemetry() with a sliding-60s rate cap.
 
-        Sleeps until the oldest tracked submit ages out if the cap is at the
-        limit. Only invoked from the engine's tick/emit thread, so no lock is
-        needed on recent_submit_ts.
+        CRITICAL-priority frames are registered in _p2_pending so the ACK
+        handler can intercept BUFFER_FULL and queue them for bounded resubmit.
         """
         cap = self._max_submit_rate_per_min
         if cap > 0:
@@ -439,6 +519,9 @@ class IpcTransport:
                     self._recent_submit_ts.popleft()
         tid = self._client.submit_telemetry(bytes_payload, priority=priority)
         self._recent_submit_ts.append(time.monotonic())
+        if priority == getattr(self._Priority, "CRITICAL"):
+            with self._p2_pending_lock:
+                self._p2_pending[tid] = (bytes_payload, priority, _resubmit_attempt)
         return tid
 
     def _pack_and_submit_event(self, event: Event) -> int:
@@ -588,17 +671,21 @@ class IpcTransport:
             delivered = int(self._Disposition.DELIVERED)
 
             def _terminal_count() -> int:
-                # DELIVERED is the only success disposition; failures all set
-                # the 0x80 bit per spec Section 7.4. Intermediate states like
-                # QUEUED and TRANSMITTED don't count -- they aren't terminal.
                 return sum(
                     c for d, c in self._ack_counts.items()
                     if d == delivered or (d & 0x80)
                 )
 
+            def _resubmit_active() -> bool:
+                with self._resubmit_lock:
+                    queued = bool(self._resubmit_queue)
+                with self._resubmit_inflight_lock:
+                    inflight = self._resubmit_inflight > 0
+                return queued or inflight
+
             deadline = None if unlimited else time.monotonic() + drain_timeout_s
             next_progress = time.monotonic() + 30.0
-            while _terminal_count() < self._count and (
+            while (_terminal_count() < self._count or _resubmit_active()) and (
                 deadline is None or time.monotonic() < deadline
             ):
                 time.sleep(self._DRAIN_POLL_INTERVAL_S)
@@ -619,10 +706,16 @@ class IpcTransport:
                     drain_timeout_s, _terminal_count(), self._count, outstanding,
                 )
 
+        self._resubmit_stop.set()
+        self._resubmit_ready.set()
+        self._resubmit_thread.join(timeout=5.0)
+
         log.info(
             "IPC transport closing, %d frames submitted, %d P0 frames "
             "skipped (not radioed), %d preempted (shed for higher priority)",
             self._count, self._p0_frames_skipped, self._preempted_count)
+        if self._resubmit_count:
+            log.info("P2 resubmit: %d resubmissions", self._resubmit_count)
         if self._ack_counts:
             summary = ", ".join(
                 f"{self._disposition_name(d)}={c}"
