@@ -121,17 +121,38 @@ def main() -> None:
                              "events are accumulated over 30-min wall-clock-"
                              "aligned windows and emitted as a single "
                              "SB45_SIM_V4 per-window summary frame (per-type "
-                             "count buckets + coarse position). P2 events pass "
-                             "through unchanged (and are recorded in the "
-                             "summary's p2_present). Eases pressure on the "
-                             "radio's intake queue under high-density P1 "
-                             "traffic. Default off.")
+                             "count buckets + coarse position). P2 events are "
+                             "coalesced into one frame per --p2-window-s window "
+                             "(peak-severity event; recorded in the summary's "
+                             "p2_present). Eases pressure on the radio's intake "
+                             "queue under high-density P1/P2 traffic. Default "
+                             "off.")
     parser.add_argument("--batch-window-s", type=float, default=1800.0,
                         metavar="SEC",
                         help="Window size in elapsed seconds for --batch-p1. "
                              "Default 1800 (30 min, SB45_SIM_V4 -- sized by the "
                              "2026-06-07 capacity sim). Ignored without "
                              "--batch-p1.")
+    parser.add_argument("--p2-window-s", type=float, default=120.0,
+                        metavar="SEC",
+                        help="P2 coalescing window in elapsed seconds for "
+                             "--batch-p1. P2 events in a window collapse to ONE "
+                             "frame (the peak-severity event), bounding P2's "
+                             "frame rate by the window cadence. Default 120 "
+                             "(sized against mu=1 frame/4min, 2026-06-10). "
+                             "0 = per-event real-time passthrough (legacy). "
+                             "Ignored without --batch-p1.")
+    parser.add_argument("--emit-empty-windows",
+                        action=argparse.BooleanOptionalAction, default=False,
+                        help="Emit a summary frame for every crossed window "
+                             "boundary even when no P1/P2 fired. Default OFF: "
+                             "empty windows were ~79%% of the 2026-06-10 3-Pi "
+                             "offered load and the radio's mu (1 frame / 4 min) "
+                             "cannot afford them. With --no-emit-empty-windows "
+                             "(the default) a window_idx gap is ambiguous "
+                             "between 'empty' and 'dropped'; pass "
+                             "--emit-empty-windows to restore gapless liveness "
+                             "breadcrumbs. Ignored without --batch-p1.")
     # Retry-on-0x80 was removed 2026-06-07 (radio team: retry adds churn
     # without goodput at saturation). The proactive controls are V4 per-window
     # batching (--batch-p1) and the submission rate cap below.
@@ -207,7 +228,10 @@ def main() -> None:
     # wire, so over IPC they never go OTA regardless of batching.)
     if args.batch_p1:
         from skybounce_app_logistics.p1_batcher import P1BatchingTransport
-        transport = P1BatchingTransport(transport, window_s=args.batch_window_s)
+        transport = P1BatchingTransport(
+            transport, window_s=args.batch_window_s,
+            emit_empty_windows=args.emit_empty_windows,
+            p2_window_s=args.p2_window_s)
 
     print(f"Rules library: {RULES_VERSION}")
     print(f"Input:     {args.input}")

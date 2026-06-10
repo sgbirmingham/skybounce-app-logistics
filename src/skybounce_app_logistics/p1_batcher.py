@@ -8,10 +8,18 @@ Motivation
 
 The 2026-06-06 4-hour soak confirmed the radio can only absorb ~mu = 15
 frames/hr aggregate (5/hr/node). Per-event P1 streams (90-135/hr offered)
-swamp that: 15-21% accept, 3h+ backlog-drain delays. P2 (safety-immediate)
-frames must stay per-event and real-time, but P1 (medium-priority) traffic is
-collapsed to ONE summary frame per Pi per 30-min window. The raw events stay
-in the engine's local stream for forensics; nothing is lost on the sensor side.
+swamp that: 15-21% accept, 3h+ backlog-drain delays. P1 (medium-priority)
+traffic is collapsed to ONE summary frame per Pi per 30-min window.
+
+The 2026-06-10 3-Pi preempt analysis then showed P2 itself can overrun a low-mu
+radio: a tight cluster of events (e.g. an impact burst) emits a frame per event
+-- 2 per event before the precise-position companion was folded out -- and at
+mu = 1 frame / 4 min that backs up for tens of minutes. So P2 is now ALSO
+coalesced: events in a short P2 window (`p2_window_s`, default 120s) collapse to
+ONE frame -- the peak-severity event of the window -- bounding P2's frame rate
+by the window cadence instead of the event rate. Set `p2_window_s=0` to restore
+the old per-event real-time pass-through. The raw events stay in the engine's
+local stream for forensics; nothing is lost on the sensor side.
 
 Design (SB45_SIM_V4)
 --------------------
@@ -47,13 +55,15 @@ Design (SB45_SIM_V4)
   empty-window frames -- but then a gap in window_idx is ambiguous between
   "empty" and "dropped".
 
-- P2 and P0 events pass through to the inner transport. P2 is also OBSERVED by
-  the open window (sets p2_present, contributes to peak severity and position)
-  so the summary still records that a safety event occurred even if the
-  real-time P2 frame is later dropped by the radio.
+- P2 events are coalesced into a separate short P2 window (`p2_window_s`): the
+  peak-severity event of each window is emitted as ONE frame to the inner
+  transport at the window boundary. P2 is ALSO observed by the open P1 summary
+  window (sets p2_present, contributes to peak severity and position) so the
+  summary still records that a safety event occurred. With `p2_window_s=0`, P2
+  reverts to immediate per-event pass-through. P0 always passes through.
 
-- `close()` flushes the open partial window IF it saw any activity, then closes
-  the wrapped transport.
+- `close()` flushes the open partial P1 window IF it saw activity, and the open
+  P2 window if it holds a pending peak event, then closes the wrapped transport.
 
 Lifecycle
 ---------
@@ -82,6 +92,11 @@ DEFAULT_WINDOW_S = 1800.0  # 30 minutes (SB45_SIM_V4). Chosen from the
                            # 2026-06-07 capacity sim: 15-min windows put 3
                            # nodes over mu=15/hr; 30-min lands at mu (with P0
                            # dropped at the IPC wire). See the findings doc.
+DEFAULT_P2_WINDOW_S = 120.0  # P2 coalescing window. The 2026-06-10 3-Pi preempt
+                             # analysis sized this against mu = 1 frame / 4 min:
+                             # 120s collapses an impact burst to <=1 P2 frame /
+                             # 2 min / node, comfortably under mu, for <=120s of
+                             # added safety-event latency. 0 = per-event passthru.
 WINDOW_IDX_MODULUS = 4     # 2-bit window_idx; wraps every 4 windows (2h @ 30min)
 
 
@@ -150,27 +165,41 @@ class P1BatchingTransport:
         inner: Transport,
         window_s: float = DEFAULT_WINDOW_S,
         emit_empty_windows: bool = True,
+        p2_window_s: float = DEFAULT_P2_WINDOW_S,
     ) -> None:
         if window_s <= 0.0:
             raise ValueError(f"window_s must be positive, got {window_s!r}")
+        if p2_window_s < 0.0:
+            raise ValueError(
+                f"p2_window_s must be >= 0 (0 = passthrough), got {p2_window_s!r}")
         self._inner = inner
         self._window_s = float(window_s)
         self._emit_empty_windows = bool(emit_empty_windows)
+        self._p2_window_s = float(p2_window_s)
+        self._coalesce_p2 = self._p2_window_s > 0.0
 
-        # The currently-open window's accumulator.
+        # The currently-open P1 summary window's accumulator.
         self._window = _WindowState()
 
         # End-of-current-window in elapsed_s. None until first event/tick.
         self._current_window_end_s: Optional[float] = None
 
+        # P2 coalescing: peak-severity event of the open P2 window, and the
+        # window's end in elapsed_s. Both None until the first P2 event/tick.
+        self._p2_peak: Optional[Event] = None
+        self._current_p2_window_end_s: Optional[float] = None
+
         # Observability counters.
         self._p1_events_seen = 0
         self._p2_events_seen = 0
         self._summaries_emitted = 0
+        self._p2_frames_emitted = 0
 
         log.info(
-            "P1BatchingTransport: window_s=%.0fs, emit_empty_windows=%s",
-            self._window_s, self._emit_empty_windows,
+            "P1BatchingTransport: window_s=%.0fs, emit_empty_windows=%s, "
+            "p2_window_s=%.0fs (%s)",
+            self._window_s, self._emit_empty_windows, self._p2_window_s,
+            "coalesced" if self._coalesce_p2 else "per-event passthrough",
         )
 
     # -------------------------------------------------------------------------
@@ -179,9 +208,11 @@ class P1BatchingTransport:
 
     def emit(self, event: Event) -> None:
         """Route an event by priority:
-        - P1: accumulate into the open window's per-type bucket.
-        - P2: pass through to inner immediately (real-time safety), and also
-          observe it in the open window (p2_present + severity + position).
+        - P1: accumulate into the open P1 summary window's per-type bucket.
+        - P2: observe it in the open P1 summary window (p2_present + severity +
+          position), and either coalesce it into the open P2 window (keeping the
+          peak-severity event) or, when p2_window_s=0, pass it through to inner
+          immediately (legacy real-time behavior).
         - P0: pass through unchanged.
         """
         if event.priority == "P1":
@@ -192,7 +223,13 @@ class P1BatchingTransport:
             self._roll_to_event(event.elapsed_s)
             self._window.note_p2(event)
             self._p2_events_seen += 1
-            self._inner.emit(event)
+            if self._coalesce_p2:
+                self._roll_p2_to_event(event.elapsed_s)
+                # Peak-severity event represents the window; first max wins ties.
+                if self._p2_peak is None or event.score > self._p2_peak.score:
+                    self._p2_peak = event
+            else:
+                self._inner.emit(event)
         else:  # P0
             self._inner.emit(event)
 
@@ -214,6 +251,13 @@ class P1BatchingTransport:
             self._close_window(self._current_window_end_s)
             self._current_window_end_s += self._window_s
 
+        if self._coalesce_p2:
+            self._lazy_init_p2_window(elapsed_s)
+            assert self._current_p2_window_end_s is not None
+            while elapsed_s >= self._current_p2_window_end_s:
+                self._close_p2_window()
+                self._current_p2_window_end_s += self._p2_window_s
+
         self._inner.tick(ts_epoch_s, elapsed_s)
 
     def close(self, drain_timeout_s: Optional[float] = None) -> None:
@@ -224,10 +268,13 @@ class P1BatchingTransport:
         terminal, so a backed-up radio queue isn't abandoned at close)."""
         if self._current_window_end_s is not None and self._window.any_activity:
             self._close_window(self._current_window_end_s)
+        if self._coalesce_p2 and self._p2_peak is not None:
+            self._close_p2_window()
         log.info(
             "P1BatchingTransport closing: p1_events_seen=%d, p2_events_seen=%d, "
-            "summaries_emitted=%d",
+            "summaries_emitted=%d, p2_frames_emitted=%d",
             self._p1_events_seen, self._p2_events_seen, self._summaries_emitted,
+            self._p2_frames_emitted,
         )
         self._inner.close(drain_timeout_s)
 
@@ -246,6 +293,12 @@ class P1BatchingTransport:
     @property
     def summaries_emitted(self) -> int:
         return self._summaries_emitted
+
+    @property
+    def p2_frames_emitted(self) -> int:
+        """P2 frames actually put on the wire (one per non-empty P2 window when
+        coalescing; equals p2_events_seen in passthrough mode)."""
+        return self._p2_frames_emitted
 
     # -------------------------------------------------------------------------
     # Internals
@@ -276,6 +329,34 @@ class P1BatchingTransport:
         """Next multiple of window_s strictly greater than elapsed_s."""
         n_completed = int(elapsed_s // self._window_s)
         return (n_completed + 1) * self._window_s
+
+    def _lazy_init_p2_window(self, elapsed_s: float) -> None:
+        if self._current_p2_window_end_s is None:
+            n_completed = int(elapsed_s // self._p2_window_s)
+            self._current_p2_window_end_s = (n_completed + 1) * self._p2_window_s
+
+    def _roll_p2_to_event(self, elapsed_s: float) -> None:
+        """Ensure the open P2 accumulator is the window containing elapsed_s,
+        flushing earlier windows first -- mirrors _roll_to_event so a P2 event
+        arriving after a boundary that no tick has crossed yet is attributed to
+        its own window rather than folded into the previous one."""
+        self._lazy_init_p2_window(elapsed_s)
+        assert self._current_p2_window_end_s is not None
+        n_completed = int(elapsed_s // self._p2_window_s)
+        event_window_end = (n_completed + 1) * self._p2_window_s
+        while self._current_p2_window_end_s < event_window_end:
+            self._close_p2_window()
+            self._current_p2_window_end_s += self._p2_window_s
+
+    def _close_p2_window(self) -> None:
+        """Emit the peak-severity P2 event of the just-closed P2 window (if any)
+        as ONE frame to the inner transport, then reset. Empty P2 windows emit
+        nothing -- P2 absence is already conveyed by the P1 summary's
+        p2_present=False, so there's no need for an empty P2 frame."""
+        if self._p2_peak is not None:
+            self._inner.emit(self._p2_peak)
+            self._p2_frames_emitted += 1
+            self._p2_peak = None
 
     def _window_idx_for(self, window_end_s: float) -> int:
         """Window index derived from elapsed position: the count of completed

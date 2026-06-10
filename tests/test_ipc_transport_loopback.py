@@ -425,14 +425,14 @@ def test_close_drains_pending_telemetry(loopback):
     validation, where a 4-event burst landed only 1 frame on the mock
     side. With the drain, all N must arrive before close() returns.
 
-    Each P2 event with GPS emits 2 telemetry frames: the event itself
-    plus a precise-position companion (V4 crash-dispatch). So N events
-    produce N_FRAMES = N * 2 on the wire.
+    Each P2 event emits exactly one telemetry frame. The precise-position
+    companion was removed 2026-06-10 (mu=1 frame/4min capacity), so N events
+    produce N_FRAMES = N on the wire.
     """
     transport, mock = loopback
     N = 5
-    # P2 + GPS → event frame + precise-position companion = 2 per emit
-    N_FRAMES = N * 2
+    # P2 event → one frame (no precise-position companion since 2026-06-10)
+    N_FRAMES = N
 
     for _ in range(N):
         transport.emit(_make_event())
@@ -466,29 +466,28 @@ def test_p2_resubmit_on_buffer_full(loopback):
     """
     transport, mock = loopback
     # First P2 event submission → BUFFER_FULL; next submission (the
-    # resubmit) → normal QUEUED+DELIVERED.  The P2 event also emits a
-    # precise-position companion (also CRITICAL), so set buffer_full to 2
-    # to reject both the event AND the precise frame on first try.
-    mock.set_buffer_full(2)
-    transport.emit(_make_event())  # P2 with gps → event + precise = 2 frames
+    # resubmit) → normal QUEUED+DELIVERED. Since 2026-06-10 a P2 event is a
+    # single frame (no precise-position companion), so reject just one.
+    mock.set_buffer_full(1)
+    transport.emit(_make_event())  # P2 event → one frame
 
     # Wait for the resubmit thread to re-submit and the mock to DELIVER.
     assert _wait_until(
-        lambda: transport._resubmit_count >= 2, timeout_s=5.0
+        lambda: transport._resubmit_count >= 1, timeout_s=5.0
     ), (
-        f"expected >=2 resubmissions; got {transport._resubmit_count} "
+        f"expected >=1 resubmission; got {transport._resubmit_count} "
         f"(ack_counts={transport.ack_counts})"
     )
-    # Both the original attempt and the resubmit arrive on the mock side.
-    # Original: 2 frames (rejected). Resubmit: 2 frames (accepted).
-    assert len(mock.received_telemetry) >= 4, (
-        f"expected >=4 TELEMETRY frames (2 rejected + 2 resubmitted); "
+    # The original attempt and the resubmit each arrive on the mock side.
+    # Original: 1 frame (rejected). Resubmit: 1 frame (accepted).
+    assert len(mock.received_telemetry) >= 2, (
+        f"expected >=2 TELEMETRY frames (1 rejected + 1 resubmitted); "
         f"got {len(mock.received_telemetry)}"
     )
     delivered = int(Disposition.DELIVERED)
     assert _wait_until(
-        lambda: transport.ack_counts.get(delivered, 0) >= 2, timeout_s=3.0
+        lambda: transport.ack_counts.get(delivered, 0) >= 1, timeout_s=3.0
     ), (
-        f"resubmitted frames should reach DELIVERED; "
+        f"resubmitted frame should reach DELIVERED; "
         f"ack_counts={transport.ack_counts}"
     )

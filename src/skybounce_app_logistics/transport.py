@@ -606,22 +606,17 @@ class IpcTransport:
         if event.priority == "P2":
             with self._p2_awaiting_lock:
                 self._p2_awaiting += 1
-        # P2 (severe_impact) gets a companion precise-position frame for
-        # real-time crash dispatch (region-absolute ~62 m). Parked/session-start
-        # precise position is forensic (on-Pi log), not radioed -- so the on-wire
-        # precise trigger is P2 only. See the V4 decision doc, Addendum 3.
-        if event.priority == "P2" and event.gps_lat is not None \
-                and event.gps_lon is not None:
-            packed = self._pack_sb45_precise(
-                self._SB45PrecisePosition(lat=event.gps_lat, lon=event.gps_lon)
-            )
-            # CRITICAL like the P2 it locates, so preemption protects it too.
-            self._rate_limited_submit_telemetry(
-                packed.bytes_payload, getattr(self._Priority, "CRITICAL"))
-            self._precise_frames_sent += 1
-            self._count += 1
-            with self._p2_awaiting_lock:
-                self._p2_awaiting += 1
+        # The companion precise-position frame (region-absolute ~62 m, CRITICAL)
+        # was REMOVED 2026-06-10. The 3-Pi preempt analysis re-derived the radio
+        # service rate at mu = 1 frame / 4 min; at that capacity a second
+        # must-deliver frame per P2 event doubles P2's footprint and overruns the
+        # link during an impact burst. The per-event SB45 frame is a full 45-bit
+        # body with no room to fold precise position in, so the companion was
+        # dropped outright -- P2 now carries the event frame's own region-
+        # absolute position (~50-140 m cell), which is sufficient for dispatch.
+        # Precise position remains in the on-Pi forensic log. To restore the
+        # on-wire companion the SB45 wire format must grow to carry it (core
+        # repo). See the resubmit/capacity handoff, 2026-06-10.
 
     def emit_summary(self, summary: SummaryEvent) -> None:
         """Pack a P1 per-window batch summary via SB45_SIM_V4

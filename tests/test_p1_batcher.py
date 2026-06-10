@@ -4,7 +4,9 @@
 """test_p1_batcher.py — P1BatchingTransport unit tests (SB45_SIM_V4).
 
 Covers the per-WINDOW V4 model:
-- P2 passes through immediately AND is recorded in the window (p2_present).
+- P2 is coalesced into one frame per p2_window_s window (peak-severity event)
+  AND recorded in the P1 summary window (p2_present); p2_window_s=0 restores
+  immediate per-event passthrough.
 - LOG passes through; P1 accumulates.
 - A window closes at elapsed_s >= boundary; ONE summary per window aggregates
   all P1 types into code_counts.
@@ -98,13 +100,56 @@ def _batcher_no_empties(spy, window_s=300.0):
 # Routing
 # -----------------------------------------------------------------------------
 
-def test_p2_passes_through_immediately():
+def test_p2_coalesced_held_until_window_boundary():
+    # Default coalescing: a P2 event is NOT emitted on arrival; it's held as the
+    # open P2 window's peak and emitted when a tick crosses the window boundary.
     spy = SpyTransport()
-    batcher = P1BatchingTransport(spy)
+    batcher = P1BatchingTransport(spy, p2_window_s=120.0)
     p2 = make_event(event_type="hard_brake", priority="P2", elapsed_s=10.0)
     batcher.emit(p2)
-    assert spy.per_event == [p2]      # reached inner untouched
-    assert spy.summaries == []        # window hasn't closed
+    assert spy.per_event == []        # held, not yet on the wire
+    batcher.tick(ts_epoch_s=0, elapsed_s=120.0)   # cross the P2 window boundary
+    assert spy.per_event == [p2]      # peak emitted once, untouched
+    assert batcher.p2_frames_emitted == 1
+
+
+def test_p2_passthrough_when_window_zero():
+    # p2_window_s=0 restores legacy per-event real-time passthrough.
+    spy = SpyTransport()
+    batcher = P1BatchingTransport(spy, p2_window_s=0.0)
+    p2 = make_event(event_type="hard_brake", priority="P2", elapsed_s=10.0)
+    batcher.emit(p2)
+    assert spy.per_event == [p2]      # reached inner immediately
+    assert spy.summaries == []        # P1 window hasn't closed
+
+
+def test_p2_coalesce_keeps_peak_severity():
+    # Several P2 events in one window collapse to ONE frame: the peak-severity
+    # event; first max wins ties.
+    spy = SpyTransport()
+    batcher = P1BatchingTransport(spy, p2_window_s=120.0)
+    low = make_event(event_type="hard_brake", priority="P2",
+                     elapsed_s=10.0, score=0.40)
+    peak = make_event(event_type="severe_impact", priority="P2",
+                      elapsed_s=20.0, score=0.95)
+    mid = make_event(event_type="moderate_impact", priority="P2",
+                     elapsed_s=30.0, score=0.70)
+    for e in (low, peak, mid):
+        batcher.emit(e)
+    batcher.tick(ts_epoch_s=0, elapsed_s=120.0)
+    assert spy.per_event == [peak]    # one frame, the peak
+    assert batcher.p2_frames_emitted == 1
+
+
+def test_close_flushes_pending_p2():
+    spy = SpyTransport()
+    batcher = P1BatchingTransport(spy, p2_window_s=120.0)
+    p2 = make_event(event_type="severe_impact", priority="P2",
+                    elapsed_s=10.0, score=0.9)
+    batcher.emit(p2)
+    batcher.close()                   # no tick crossed the P2 boundary
+    assert spy.per_event == [p2]      # flushed at close
+    assert spy.closed is True
 
 
 def test_p0_passes_through():
@@ -257,9 +302,9 @@ def test_window_idx_gap_robust_when_skipping_empties():
 # P2 recorded in the window summary
 # -----------------------------------------------------------------------------
 
-def test_p2_recorded_in_window_and_passes_through():
+def test_p2_recorded_in_window_and_emitted_as_frame():
     spy = SpyTransport()
-    batcher = _batcher_no_empties(spy, window_s=300.0)
+    batcher = _batcher_no_empties(spy, window_s=300.0)   # p2_window_s=120 default
     p2 = make_event(event_type="severe_impact", priority="P2",
                     elapsed_s=10.0, score=0.95)
     p1 = make_event(event_type="moderate_impact", priority="P1",
@@ -267,7 +312,9 @@ def test_p2_recorded_in_window_and_passes_through():
     batcher.emit(p2)
     batcher.emit(p1)
     batcher.tick(ts_epoch_s=0, elapsed_s=300.0)
-    assert spy.per_event == [p2]                 # P2 still real-time
+    # P2 coalesced and emitted once (at its 120s window, crossed by the tick);
+    # also recorded in the P1 summary's p2_present / peak severity.
+    assert spy.per_event == [p2]
     s = spy.summaries[0]
     assert s.p2_present is True
     assert s.code_counts == {"moderate_impact": 1}   # P2 NOT counted here
