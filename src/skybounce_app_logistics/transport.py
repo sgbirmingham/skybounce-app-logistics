@@ -216,6 +216,7 @@ class IpcTransport:
         endpoint_id: int,
         socket_path: Optional[str] = None,
         max_submit_rate_per_min: float = 0.0,
+        p2_resubmit_backoff: tuple = (15.0, 60.0, 120.0),
     ) -> None:
         # Defer imports until construction so module imports cleanly without IPC.
         try:
@@ -285,13 +286,21 @@ class IpcTransport:
         self._recent_submit_ts: collections.deque = collections.deque()
         self._rate_limit_sleeps = 0
 
-        # P2 resubmit: when a CRITICAL-priority frame (P2 event or precise-
-        # position) gets DROPPED_BUFFER_FULL, re-submit it until delivered.
-        # The resubmit thread wakes on _resubmit_ready, pops one entry,
-        # waits an exponential backoff (1s, 2s, 4s, ... capped at 30s),
-        # and re-submits.  No attempt limit — P2 crash frames keep trying
-        # until they get through or the transport closes.
-        self._P2_RESUBMIT_BACKOFF_SCHEDULE = (15.0, 60.0, 120.0)
+        # P2 resubmit: when a CRITICAL-priority frame (P2 event) gets
+        # DROPPED_BUFFER_FULL, re-submit it until delivered. The resubmit thread
+        # wakes on _resubmit_ready, pops one entry, waits the backoff for that
+        # attempt (schedule[min(attempt, len-1)]), and re-submits. No attempt
+        # limit — P2 crash frames keep trying until delivered or the transport
+        # closes. Schedule is configurable (default 15/60/120; the radio team's
+        # gentler 90/180/300 keeps the first retry >= the drain interval so a
+        # retry doesn't re-flood a queue that hasn't drained yet).
+        if not p2_resubmit_backoff or any(
+                float(x) <= 0.0 for x in p2_resubmit_backoff):
+            raise ValueError(
+                "p2_resubmit_backoff must be a non-empty sequence of positive "
+                f"seconds, got {p2_resubmit_backoff!r}")
+        self._P2_RESUBMIT_BACKOFF_SCHEDULE = tuple(
+            float(x) for x in p2_resubmit_backoff)
         self._p2_pending: dict[int, tuple[bytes, Any, int]] = {}
         self._p2_pending_lock = threading.Lock()
         self._resubmit_queue: list[tuple[bytes, Any, int]] = []

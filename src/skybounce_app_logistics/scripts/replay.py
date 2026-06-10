@@ -188,12 +188,30 @@ def main() -> None:
                              "Suggested starting point: 30 (one submit per "
                              "2 sec). Honors radio team's app-side "
                              "rate-limiting request. Default: 0.")
+    parser.add_argument("--p2-resubmit-backoff", type=str, default="15,60,120",
+                        metavar="S1,S2,...",
+                        help="--transport ipc only. Comma-separated backoff "
+                             "seconds for P2 resubmit on BUFFER_FULL; the last "
+                             "value is the cap for further attempts. Default "
+                             "'15,60,120' (deployed). The radio team's gentler "
+                             "'90,180,300' keeps the first retry >= the ~30s "
+                             "drain interval so a retry doesn't re-flood a queue "
+                             "that hasn't drained yet.")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
 
     if args.rate is not None and args.rate <= 0:
         parser.error(f"--rate must be positive (got {args.rate})")
+
+    try:
+        p2_backoff = tuple(
+            float(x) for x in args.p2_resubmit_backoff.split(","))
+        if not p2_backoff or any(x <= 0 for x in p2_backoff):
+            raise ValueError
+    except ValueError:
+        parser.error("--p2-resubmit-backoff must be comma-separated positive "
+                     f"seconds (got {args.p2_resubmit_backoff!r})")
 
     logging.basicConfig(
         level=getattr(logging, args.log_level),
@@ -216,6 +234,7 @@ def main() -> None:
                 endpoint_id=args.endpoint_id,
                 socket_path=args.socket,
                 max_submit_rate_per_min=args.max_submit_rate_per_min,
+                p2_resubmit_backoff=p2_backoff,
             )
         except ImportError as e:
             parser.error(f"--transport ipc requires skybounce-ipc-python: {e}")
