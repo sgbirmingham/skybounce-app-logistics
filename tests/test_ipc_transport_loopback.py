@@ -424,9 +424,15 @@ def test_close_drains_pending_telemetry(loopback):
     Regression test for the close-race observed during 2026-05-27 Pi
     validation, where a 4-event burst landed only 1 frame on the mock
     side. With the drain, all N must arrive before close() returns.
+
+    Each P2 event with GPS emits 2 telemetry frames: the event itself
+    plus a precise-position companion (V4 crash-dispatch). So N events
+    produce N_FRAMES = N * 2 on the wire.
     """
     transport, mock = loopback
     N = 5
+    # P2 + GPS → event frame + precise-position companion = 2 per emit
+    N_FRAMES = N * 2
 
     for _ in range(N):
         transport.emit(_make_event())
@@ -436,14 +442,14 @@ def test_close_drains_pending_telemetry(loopback):
     # a ~20ms cadence, so total drain wait should be well under a second.
     transport.close()
 
-    assert len(mock.received_telemetry) == N, (
-        f"expected {N} TELEMETRY frames on mock side after close; got "
+    assert len(mock.received_telemetry) == N_FRAMES, (
+        f"expected {N_FRAMES} TELEMETRY frames on mock side after close; got "
         f"{len(mock.received_telemetry)} "
         f"(ids={[t.telemetry_id for t in mock.received_telemetry]})"
     )
     delivered = int(Disposition.DELIVERED)
-    assert transport.ack_counts.get(delivered, 0) == N, (
-        f"expected {N} DELIVERED ACKs accounted for in transport; "
+    assert transport.ack_counts.get(delivered, 0) == N_FRAMES, (
+        f"expected {N_FRAMES} DELIVERED ACKs accounted for in transport; "
         f"got ack_counts={transport.ack_counts}"
     )
 

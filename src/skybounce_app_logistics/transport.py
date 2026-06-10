@@ -291,8 +291,7 @@ class IpcTransport:
         # waits an exponential backoff (1s, 2s, 4s, ... capped at 30s),
         # and re-submits.  No attempt limit — P2 crash frames keep trying
         # until they get through or the transport closes.
-        self._P2_RESUBMIT_INITIAL_BACKOFF_S = 1.0
-        self._P2_RESUBMIT_MAX_BACKOFF_S = 30.0
+        self._P2_RESUBMIT_BACKOFF_SCHEDULE = (15.0, 60.0, 120.0)
         self._p2_pending: dict[int, tuple[bytes, Any, int]] = {}
         self._p2_pending_lock = threading.Lock()
         self._resubmit_queue: list[tuple[bytes, Any, int]] = []
@@ -302,6 +301,8 @@ class IpcTransport:
         self._resubmit_inflight = 0
         self._resubmit_inflight_lock = threading.Lock()
         self._resubmit_stop = threading.Event()
+        self._p2_awaiting = 0
+        self._p2_awaiting_lock = threading.Lock()
 
         # Guard against double-close (drain timeout makes calling close()
         # twice expensive otherwise, and SkyBounceClient.stop() is not
@@ -324,12 +325,11 @@ class IpcTransport:
 
         log.info(
             "IPC transport started, endpoint_id=0x%08X, rate_limit=%s/min "
-            "(P2 resubmit: unlimited, backoff %.1fs-%.1fs)",
+            "(P2 resubmit: unlimited, backoff schedule=%s)",
             endpoint_id,
             f"{self._max_submit_rate_per_min:.0f}"
             if self._max_submit_rate_per_min > 0 else "unlimited",
-            self._P2_RESUBMIT_INITIAL_BACKOFF_S,
-            self._P2_RESUBMIT_MAX_BACKOFF_S,
+            self._P2_RESUBMIT_BACKOFF_SCHEDULE,
         )
 
     # -------------------------------------------------------------------------
@@ -370,7 +370,10 @@ class IpcTransport:
         if self._DROPPED_PREEMPTED is not None and disp == self._DROPPED_PREEMPTED:
             self._preempted_count += 1
             with self._p2_pending_lock:
-                self._p2_pending.pop(tid, None)
+                was_p2 = self._p2_pending.pop(tid, None) is not None
+            if was_p2:
+                with self._p2_awaiting_lock:
+                    self._p2_awaiting -= 1
             log.info(
                 "TELEMETRY_ACK tid=%d disposition=%s reason=0x%04X "
                 "(shed for a higher-priority frame; expected under contention)",
@@ -403,7 +406,10 @@ class IpcTransport:
         else:
             if disp == int(self._Disposition.DELIVERED):
                 with self._p2_pending_lock:
-                    self._p2_pending.pop(tid, None)
+                    was_p2 = self._p2_pending.pop(tid, None) is not None
+                if was_p2:
+                    with self._p2_awaiting_lock:
+                        self._p2_awaiting -= 1
             log.info(
                 "TELEMETRY_ACK tid=%d disposition=%s reason=0x%04X",
                 tid, name, ack.reason_code,
@@ -469,10 +475,8 @@ class IpcTransport:
                 payload, priority, attempt = self._resubmit_queue.pop(0)
             with self._resubmit_inflight_lock:
                 self._resubmit_inflight += 1
-            backoff = min(
-                self._P2_RESUBMIT_INITIAL_BACKOFF_S * (2 ** (attempt - 1)) if attempt > 0 else self._P2_RESUBMIT_INITIAL_BACKOFF_S,
-                self._P2_RESUBMIT_MAX_BACKOFF_S,
-            )
+            sched = self._P2_RESUBMIT_BACKOFF_SCHEDULE
+            backoff = sched[min(attempt, len(sched) - 1)]
             time.sleep(backoff)
             tid = self._rate_limited_submit_telemetry(
                 payload, priority, _resubmit_attempt=attempt)
@@ -599,6 +603,9 @@ class IpcTransport:
             return
         self._pack_and_submit_event(event)
         self._count += 1
+        if event.priority == "P2":
+            with self._p2_awaiting_lock:
+                self._p2_awaiting += 1
         # P2 (severe_impact) gets a companion precise-position frame for
         # real-time crash dispatch (region-absolute ~62 m). Parked/session-start
         # precise position is forensic (on-Pi log), not radioed -- so the on-wire
@@ -613,6 +620,8 @@ class IpcTransport:
                 packed.bytes_payload, getattr(self._Priority, "CRITICAL"))
             self._precise_frames_sent += 1
             self._count += 1
+            with self._p2_awaiting_lock:
+                self._p2_awaiting += 1
 
     def emit_summary(self, summary: SummaryEvent) -> None:
         """Pack a P1 per-window batch summary via SB45_SIM_V4
@@ -685,15 +694,17 @@ class IpcTransport:
 
             deadline = None if unlimited else time.monotonic() + drain_timeout_s
             next_progress = time.monotonic() + 30.0
-            while (_terminal_count() < self._count or _resubmit_active()) and (
+            while (_terminal_count() < self._count or _resubmit_active()
+                   or self._p2_awaiting > 0) and (
                 deadline is None or time.monotonic() < deadline
             ):
                 time.sleep(self._DRAIN_POLL_INTERVAL_S)
                 if unlimited and time.monotonic() >= next_progress:
                     log.info(
-                        "IPC transport draining: %d/%d frames terminal -- waiting "
+                        "IPC transport draining: %d/%d frames terminal, "
+                        "%d P2 awaiting delivery -- waiting "
                         "for the radio to deliver its backlog (Ctrl-C to stop)",
-                        _terminal_count(), self._count,
+                        _terminal_count(), self._count, self._p2_awaiting,
                     )
                     next_progress = time.monotonic() + 30.0
 
