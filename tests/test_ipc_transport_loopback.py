@@ -465,6 +465,10 @@ def test_p2_resubmit_on_buffer_full(loopback):
     the frame ultimately DELIVERED).
     """
     transport, mock = loopback
+    # Use a fast resubmit backoff so the test doesn't wait the deployed
+    # 15s first step. The resubmit loop reads this attribute each iteration,
+    # so overriding it post-construction (before the resubmit fires) is safe.
+    transport._P2_RESUBMIT_BACKOFF_SCHEDULE = (0.05,)
     # First P2 event submission → BUFFER_FULL; next submission (the
     # resubmit) → normal QUEUED+DELIVERED. Since 2026-06-10 a P2 event is a
     # single frame (no precise-position companion), so reject just one.
