@@ -662,10 +662,18 @@ class IpcTransport:
         its writer queue, so without this wait the replay-mode pattern of
         "submit a burst, then immediately close" drops in-flight frames.
 
-        If the deadline passes with submissions still outstanding, logs a
-        WARNING with the outstanding count and proceeds to stop -- the daemon
-        will see the disconnect and stop ACKing, but at least the operator
-        knows how much was lost.
+        The drain ends when one of three things happens:
+          1. every submitted frame is terminal (DELIVERED or dropped) -- the
+             normal, complete case;
+          2. the peer/link disconnects -- the outstanding in-flight frames can
+             no longer be delivered (the client drops frames while not STEADY),
+             so we stop rather than hang forever waiting on ACKs that will never
+             come, and count them dropped;
+          3. drain_timeout_s > 0 and the deadline passes.
+        In cases 2 and 3 a WARNING reports how many frames were lost. With the
+        default drain_timeout_s <= 0 (unlimited) the only exits are (1) full
+        delivery or (2) peer disconnect -- so a slow-but-alive radio is waited
+        out fully, while a dead peer no longer wedges the process.
 
         Idempotent: a second call is a no-op.
         """
@@ -698,10 +706,19 @@ class IpcTransport:
 
             deadline = None if unlimited else time.monotonic() + drain_timeout_s
             next_progress = time.monotonic() + 30.0
+            disconnected = False
             while (_terminal_count() < self._count or _resubmit_active()
-                   or self._p2_awaiting > 0) and (
-                deadline is None or time.monotonic() < deadline
-            ):
+                   or self._p2_awaiting > 0):
+                # Stop waiting the moment the peer/link is gone. The client drops
+                # frames composed while not STEADY, so once disconnected the
+                # outstanding in-flight frames can NEVER reach a terminal ACK --
+                # waiting on them would hang the drain forever (observed when the
+                # radio bridge was torn down mid-drain). Treat them as dropped.
+                if not self._client.is_steady:
+                    disconnected = True
+                    break
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
                 time.sleep(self._DRAIN_POLL_INTERVAL_S)
                 if unlimited and time.monotonic() >= next_progress:
                     log.info(
@@ -714,12 +731,20 @@ class IpcTransport:
 
             outstanding = self._count - _terminal_count()
             if outstanding > 0:
-                log.warning(
-                    "IPC transport close: drain deadline (%.1fs) reached with "
-                    "%d/%d telemetries terminal; %d in-flight frames will be "
-                    "dropped at socket close",
-                    drain_timeout_s, _terminal_count(), self._count, outstanding,
-                )
+                if disconnected:
+                    log.warning(
+                        "IPC transport close: peer disconnected with %d/%d "
+                        "telemetries terminal; %d in-flight frame(s) dropped "
+                        "(unsendable once the peer is gone)",
+                        _terminal_count(), self._count, outstanding,
+                    )
+                else:
+                    log.warning(
+                        "IPC transport close: drain deadline (%.1fs) reached with "
+                        "%d/%d telemetries terminal; %d in-flight frames will be "
+                        "dropped at socket close",
+                        drain_timeout_s, _terminal_count(), self._count, outstanding,
+                    )
 
         self._resubmit_stop.set()
         self._resubmit_ready.set()

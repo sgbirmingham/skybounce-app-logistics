@@ -117,6 +117,7 @@ class MockSkyBounce:
         self._thread: threading.Thread | None = None
         self.buffer_full_count = 0
         self._buffer_full_remaining = 0
+        self._silent = False
 
     # ---- lifecycle -----------------------------------------------------------
 
@@ -194,6 +195,11 @@ class MockSkyBounce:
         DROPPED_BUFFER_FULL instead of QUEUED+DELIVERED."""
         self._buffer_full_remaining = count
 
+    def set_silent(self, on: bool = True) -> None:
+        """Receive TELEMETRY but send NO ACK -- frames stay in-flight forever.
+        Used to exercise the close()-drain exit on peer disconnect."""
+        self._silent = on
+
     # ---- session loop --------------------------------------------------------
 
     def _serve(self) -> None:
@@ -248,6 +254,8 @@ class MockSkyBounce:
         if msg_type == MsgType.TELEMETRY:
             tel = Telemetry.unpack(payload)
             self.received_telemetry.append(tel)
+            if self._silent:
+                return  # receive but never ACK -> frame stays in-flight
             if self._buffer_full_remaining > 0:
                 self._buffer_full_remaining -= 1
                 self.buffer_full_count += 1
@@ -495,3 +503,26 @@ def test_p2_resubmit_on_buffer_full(loopback):
         f"resubmitted frame should reach DELIVERED; "
         f"ack_counts={transport.ack_counts}"
     )
+
+
+def test_close_exits_on_peer_disconnect_without_hanging(loopback):
+    """close()'s unlimited drain must NOT hang when the peer disconnects while a
+    frame is still in-flight. The client drops frames composed while not STEADY,
+    so a stranded frame can never reach a terminal ACK; close() must detect the
+    disconnect, count it dropped, and return. Regression for the 2026-06-11
+    mid-drain bridge teardown that wedged the sender until SIGKILL."""
+    transport, mock = loopback
+    mock.set_silent(True)              # receive but never ACK -> in-flight forever
+    transport.emit(_make_event())      # P2 submitted, no terminal disposition
+    assert _wait_until(
+        lambda: len(mock.received_telemetry) >= 1, timeout_s=2.0
+    ), "mock never received the frame"
+
+    mock.stop()                        # peer disconnects mid-flight
+
+    t0 = time.monotonic()
+    transport.close()                  # unlimited drain (default); must return
+    elapsed = time.monotonic() - t0
+    assert elapsed < 8.0, f"close() hung {elapsed:.1f}s after peer disconnect"
+    # the stranded frame was never DELIVERED -- it's counted dropped at close
+    assert transport.ack_counts.get(int(Disposition.DELIVERED), 0) == 0
