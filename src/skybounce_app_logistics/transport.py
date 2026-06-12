@@ -206,10 +206,12 @@ class IpcTransport:
     # short enough that a stuck daemon doesn't hang process shutdown.
     _DEFAULT_CLOSE_DRAIN_TIMEOUT_S = 5.0
 
-    # Poll cadence while waiting for terminal dispositions. 20 ms keeps
-    # the wait responsive without busy-looping; ACKs only flow during
-    # daemon round-trips so finer granularity buys nothing.
-    _DRAIN_POLL_INTERVAL_S = 0.02
+    # Poll cadence while waiting for terminal dispositions. The events this
+    # loop waits on arrive on radio timescales (one delivery per ~30s-3min),
+    # and its other exit -- peer disconnect -- is fine at sub-second latency,
+    # so 250 ms is plenty responsive. (Was 20 ms, which polled ~1500x per
+    # expected event for no benefit.)
+    _DRAIN_POLL_INTERVAL_S = 0.25
 
     def __init__(
         self,
