@@ -116,6 +116,31 @@ def main() -> None:
                         metavar="SEC",
                         help="Window size in elapsed seconds for --batch-p1. "
                              "Default 300 (5 min). Ignored without --batch-p1.")
+    parser.add_argument("--max-retries", type=int, default=10, metavar="N",
+                        help="--transport ipc only. On 0x80 "
+                             "DROPPED_BUFFER_FULL, re-queue the underlying "
+                             "frame for re-submission with exponential "
+                             "backoff (10s, 20s, 40s, capped at 120s). N is "
+                             "the absolute attempt cap per origin -- the "
+                             "wall-clock --max-retry-window-s bound is the "
+                             "primary limit. 0 = no retry. Default: 10.")
+    parser.add_argument("--max-retry-window-s", type=float, default=600.0,
+                        metavar="SEC",
+                        help="--transport ipc only. Wall-clock cap per "
+                             "origin frame: stop retrying after N seconds "
+                             "from first attempt. PRIMARY effective limit. "
+                             "Matches the radio team's 25-min retry/relay "
+                             "framing. Default: 600 (10 min). 0 disables "
+                             "(rely on --max-retries only). Ignored when "
+                             "--max-retries=0.")
+    parser.add_argument("--max-submit-rate-per-min", type=float, default=0.0,
+                        metavar="N",
+                        help="--transport ipc only. Cap submissions to N per "
+                             "minute (sliding 60s window). Helps prevent "
+                             "BUFFER_FULL in the first place. 0 = unlimited. "
+                             "Suggested starting point: 30 (one submit per "
+                             "2 sec). Honors radio team's app-side "
+                             "rate-limiting request. Default: 0.")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
@@ -143,6 +168,9 @@ def main() -> None:
             transport = IpcTransport(
                 endpoint_id=args.endpoint_id,
                 socket_path=args.socket,
+                max_retries=args.max_retries,
+                max_retry_window_s=args.max_retry_window_s,
+                max_submit_rate_per_min=args.max_submit_rate_per_min,
             )
         except ImportError as e:
             parser.error(f"--transport ipc requires skybounce-ipc-python: {e}")
