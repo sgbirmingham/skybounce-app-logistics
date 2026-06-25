@@ -88,6 +88,7 @@ class SensorFrame:
     gps_lon: Optional[float]
     gps_speed_m_s: Optional[float]
     gps_time: str              # ISO string from gpsd, used for repeat detection
+    gps_track_deg: Optional[float] = None   # heading; sharp-turn lateral accel
 
     @classmethod
     def from_row(cls, row: dict) -> "SensorFrame":
@@ -109,6 +110,7 @@ class SensorFrame:
             gps_lat=_safe_float(row.get("gps_lat")),
             gps_lon=_safe_float(row.get("gps_lon")),
             gps_speed_m_s=_safe_float(row.get("gps_speed_m_s")),
+            gps_track_deg=_safe_float(row.get("gps_track_deg")),
             gps_time=str(row.get("gps_time", "") or ""),
         )
 

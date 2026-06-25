@@ -28,6 +28,7 @@ from skybounce_event_rules import (
     gps_confidence_raw,
     gps_quality_state,
     jerk_g_per_s,
+    lateral_accel_m_s2,
     linear_accel_g,
     longitudinal_accel_m_s2,
     movement_state_raw,
@@ -69,6 +70,10 @@ class ComputedFeatures:
     analyzer_state_candidate: str
     analyzer_state: str         # committed state after dwell
 
+    # Cornering (v0_4_0): GPS heading-rate lateral accel, m/s^2. Trailing default
+    # so interval-event snapshots that omit it still construct.
+    lat_accel_m_s2: float = 0.0
+
 
 @dataclass
 class StreamingState:
@@ -84,6 +89,7 @@ class StreamingState:
     prev_speed_m_s: Optional[float] = None
     prev_gps_lat: Optional[float] = None
     prev_gps_lon: Optional[float] = None
+    prev_gps_track_deg: Optional[float] = None
     prev_gps_time: str = ""
 
     # GPS fix age tracking
@@ -419,15 +425,23 @@ def process_frame(
 
     # -- GPS-derived accel/decel ---------------------------------------------
     # Match the analyzer's pandas behavior: pd.to_numeric(...).fillna(0) means
-    # missing speed values are treated as 0.0 in the diff calculation. This
-    # is faithful to the oracle, including the spurious-glitch events the
-    # analyzer also fires. Filtering out unphysical glitches is a deliberate
-    # rule-set change that should bump RULES_VERSION; not done in v0.1.
+    # missing speed values are treated as 0.0 in the diff calculation. The raw
+    # decel/accel still reflect GPS speed deltas (including glitch spikes); as of
+    # event_rules_v0_4_0 the detectors reject the unphysical ones via frame-GPS
+    # trust, location, IMU corroboration, and a physical cap (see is_hard_brake).
     speed_now = frame.gps_speed_m_s if frame.gps_speed_m_s is not None else 0.0
     prev_speed = state.prev_speed_m_s if state.prev_speed_m_s is not None else 0.0
     long_a = longitudinal_accel_m_s2(speed_now, prev_speed, dt_s)
     decel = max(0.0, -long_a) if long_a < 0 else 0.0
     accel = max(0.0, long_a) if long_a > 0 else 0.0
+
+    # -- GPS heading-rate lateral accel (sharp-turn signal, v0_4_0) ----------
+    # Mirrors edge_analyzer's lat_accel_m_s2 = |speed * d(track)/dt| with the
+    # heading delta wrapped to [-180, 180]. speed_now is the fillna(0) value,
+    # matching the analyzer.
+    lat_accel = lateral_accel_m_s2(
+        speed_now, frame.gps_track_deg, state.prev_gps_track_deg, dt_s,
+    )
 
     # -- GPS fix age ---------------------------------------------------------
     if _is_good_fix(frame, cfg):
@@ -490,6 +504,7 @@ def process_frame(
     state.prev_speed_m_s = speed_now
     state.prev_gps_lat = frame.gps_lat
     state.prev_gps_lon = frame.gps_lon
+    state.prev_gps_track_deg = frame.gps_track_deg
     state.prev_gps_time = frame.gps_time
 
     return ComputedFeatures(
@@ -512,4 +527,5 @@ def process_frame(
         speed_m_s=speed_now,
         analyzer_state_candidate=cand,
         analyzer_state=committed,
+        lat_accel_m_s2=lat_accel,
     )

@@ -60,6 +60,7 @@ class Event:
     anchor_lat: Optional[float]
     anchor_lon: Optional[float]
     analyzer_state: str
+    lat_accel_m_s2: float = 0.0   # GPS heading-rate lateral accel (sharp_turn), v0_4_0
 
 
 # -----------------------------------------------------------------------------

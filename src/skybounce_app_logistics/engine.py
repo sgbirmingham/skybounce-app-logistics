@@ -27,8 +27,12 @@ from skybounce_event_rules import (
     is_gps_loss_while_moving,
     is_hard_accel,
     is_hard_brake,
+    is_moderate_accel,
+    is_moderate_brake,
     is_moderate_impact,
+    is_moderate_turn,
     is_severe_impact,
+    is_sharp_turn,
 )
 
 from .csv_source import SensorFrame
@@ -272,11 +276,20 @@ class StreamingEngine:
         if fired and cooldown_ok(self.state.last_event_ts, "moderate_impact", t, cfg.impact_cooldown_s):
             self._emit_event(feats, "moderate_impact", score, detail)
 
+        # v0_4_0 corroboration inputs shared by brake / accel / turn. The frame's
+        # own GPS quality (not the lagging smoothed confidence) plus a present
+        # location guard against degraded-fix speed glitches; mirrors the oracle.
+        frame_confident = feats.gps_quality_state == "GPS_CONFIDENT"
+        loc_present = frame.gps_lat is not None and frame.gps_lon is not None
+
         # Hard brake
         fired, score, detail = is_hard_brake(
             decel=feats.decel_m_s2,
             gps_confidence=feats.gps_confidence,
             cfg=cfg,
+            lin_accel_g=feats.lin_accel_g,
+            frame_gps_confident=frame_confident,
+            has_location=loc_present,
         )
         if fired and cooldown_ok(self.state.last_event_ts, "hard_brake", t, cfg.accel_event_cooldown_s):
             self._emit_event(feats, "hard_brake", score, detail)
@@ -286,9 +299,47 @@ class StreamingEngine:
             accel=feats.accel_m_s2,
             gps_confidence=feats.gps_confidence,
             cfg=cfg,
+            lin_accel_g=feats.lin_accel_g,
+            frame_gps_confident=frame_confident,
+            has_location=loc_present,
         )
         if fired and cooldown_ok(self.state.last_event_ts, "hard_accel", t, cfg.accel_event_cooldown_s):
             self._emit_event(feats, "hard_accel", score, detail)
+
+        # Sharp turn (v0_4_0): GPS heading-rate lateral acceleration.
+        fired, score, detail = is_sharp_turn(
+            lat_accel=feats.lat_accel_m_s2,
+            gps_confidence=feats.gps_confidence,
+            gps_speed_m_s=feats.speed_m_s,
+            cfg=cfg,
+            frame_gps_confident=frame_confident,
+            has_location=loc_present,
+        )
+        if fired and cooldown_ok(self.state.last_event_ts, "sharp_turn", t, cfg.turn_event_cooldown_s):
+            self._emit_event(feats, "sharp_turn", score, detail)
+
+        # Moderate (sub-hard) tiers -> P0 local context (logged, not transmitted).
+        fired, score, detail = is_moderate_brake(
+            decel=feats.decel_m_s2, gps_confidence=feats.gps_confidence, cfg=cfg,
+            lin_accel_g=feats.lin_accel_g, frame_gps_confident=frame_confident, has_location=loc_present,
+        )
+        if fired and cooldown_ok(self.state.last_event_ts, "moderate_brake", t, cfg.accel_event_cooldown_s):
+            self._emit_event(feats, "moderate_brake", score, detail)
+
+        fired, score, detail = is_moderate_accel(
+            accel=feats.accel_m_s2, gps_confidence=feats.gps_confidence, cfg=cfg,
+            lin_accel_g=feats.lin_accel_g, frame_gps_confident=frame_confident, has_location=loc_present,
+        )
+        if fired and cooldown_ok(self.state.last_event_ts, "moderate_accel", t, cfg.accel_event_cooldown_s):
+            self._emit_event(feats, "moderate_accel", score, detail)
+
+        fired, score, detail = is_moderate_turn(
+            lat_accel=feats.lat_accel_m_s2, gps_confidence=feats.gps_confidence,
+            gps_speed_m_s=feats.speed_m_s, cfg=cfg,
+            frame_gps_confident=frame_confident, has_location=loc_present,
+        )
+        if fired and cooldown_ok(self.state.last_event_ts, "moderate_turn", t, cfg.turn_event_cooldown_s):
+            self._emit_event(feats, "moderate_turn", score, detail)
 
     def _resolve_pending_severe(self, feats: ComputedFeatures, t: float) -> None:
         """Confirm or expire a held severe-impact candidate.
@@ -599,6 +650,7 @@ class StreamingEngine:
             accel=feats.accel_m_s2,
             gps_confidence=feats.gps_confidence,
             has_location=has_loc,
+            lateral=feats.lat_accel_m_s2,
         )
 
         ev = Event(
@@ -615,6 +667,7 @@ class StreamingEngine:
             speed_mph=feats.speed_m_s * 2.23694,
             decel_m_s2=feats.decel_m_s2,
             accel_m_s2=feats.accel_m_s2,
+            lat_accel_m_s2=feats.lat_accel_m_s2,
             lin_accel_g=feats.lin_accel_g,
             jerk_g_s=feats.jerk_g_s,
             gps_confidence=feats.gps_confidence,
