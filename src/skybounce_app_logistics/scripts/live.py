@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import signal
 import sys
 import time
@@ -55,6 +56,15 @@ log = logging.getLogger("skybounce.app.logistics.live")
 # sensor_app_stub default so bench validation sees a consistent peer id.
 # Real deployments should set a meaningful per-device value.
 DEFAULT_ENDPOINT_ID = 0x53415050
+
+
+def _default_endpoint_id() -> int:
+    """Per-device endpoint id: $SKYBOUNCE_ENDPOINT_ID (decimal / 0x / 0o) if set,
+    else the shared placeholder. Each Pi in a fleet MUST set a unique value
+    (e.g. in its shell profile) so the basestation can route/dispatch per
+    vehicle -- a shared id misroutes ACKs and starves nodes under load."""
+    v = os.environ.get("SKYBOUNCE_ENDPOINT_ID")
+    return int(v, 0) if v else DEFAULT_ENDPOINT_ID
 
 
 # -----------------------------------------------------------------------------
@@ -116,9 +126,11 @@ def main() -> None:
                        help="Unix socket path for --transport ipc. Overrides "
                             "$SKYBOUNCE_SENSOR_SOCK; library default if unset.")
     parser.add_argument("--endpoint-id", type=lambda x: int(x, 0),
-                       default=DEFAULT_ENDPOINT_ID,
+                       default=_default_endpoint_id(),
                        help="32-bit endpoint identifier sent in HELLO "
-                            "(--transport ipc only). Decimal, 0x hex, or 0o octal.")
+                            "(--transport ipc only). Defaults to "
+                            "$SKYBOUNCE_ENDPOINT_ID if set, else the shared "
+                            "placeholder. Decimal, 0x hex, or 0o octal.")
     parser.add_argument("--stop-on-idle", action="store_true",
                        help="Exit if no new rows appear for ~5 seconds. "
                             "Useful for ad-hoc tests; do NOT use during driving.")

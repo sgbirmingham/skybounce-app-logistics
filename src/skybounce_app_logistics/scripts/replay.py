@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Iterator
@@ -80,6 +81,15 @@ def _pace_frames(frames: Iterator[SensorFrame], rate: float) -> Iterator[SensorF
 DEFAULT_ENDPOINT_ID = 0x53415050
 
 
+def _default_endpoint_id() -> int:
+    """Per-device endpoint id: $SKYBOUNCE_ENDPOINT_ID (decimal / 0x / 0o) if set,
+    else the shared placeholder. Each Pi in a fleet MUST set a unique value
+    (e.g. in its shell profile) so the basestation can route/dispatch per
+    vehicle -- a shared id misroutes ACKs and starves nodes under load."""
+    v = os.environ.get("SKYBOUNCE_ENDPOINT_ID")
+    return int(v, 0) if v else DEFAULT_ENDPOINT_ID
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Replay a logger CSV through the streaming engine.")
     parser.add_argument("--input", required=True, type=Path,
@@ -95,9 +105,11 @@ def main() -> None:
                         help="Unix socket path for --transport ipc. Overrides "
                              "$SKYBOUNCE_SENSOR_SOCK; library default if unset.")
     parser.add_argument("--endpoint-id", type=lambda x: int(x, 0),
-                        default=DEFAULT_ENDPOINT_ID,
+                        default=_default_endpoint_id(),
                         help="32-bit endpoint identifier sent in HELLO "
-                             "(--transport ipc only). Decimal, 0x hex, or 0o octal.")
+                             "(--transport ipc only). Defaults to "
+                             "$SKYBOUNCE_ENDPOINT_ID if set, else the shared "
+                             "placeholder. Decimal, 0x hex, or 0o octal.")
     parser.add_argument("--rate", type=float, default=None, metavar="N",
                         help="Pace yields at N x real-time of the row timestamps "
                              "(1.0 = real-time, 10.0 = 10x faster). Omit for "
@@ -105,23 +117,101 @@ def main() -> None:
                              "the default). Useful for sustained-load bench tests "
                              "and ACK-timing observation under realistic cadence.")
     parser.add_argument("--batch-p1", action="store_true",
-                        help="Wrap the transport in a P1BatchingTransport: "
-                             "every P1 event_type is accumulated over 5-min "
-                             "wall-clock-aligned windows and emitted as a "
-                             "single SB45_SIM_V3 summary frame per type per "
-                             "window. P2 events pass through unchanged. Useful "
-                             "to ease pressure on the radio's intake queue "
-                             "under high-density P1 traffic. Default off.")
-    parser.add_argument("--batch-window-s", type=float, default=300.0,
+                        help="Wrap the transport in a P1BatchingTransport: P1 "
+                             "events are accumulated over 30-min wall-clock-"
+                             "aligned windows and emitted as a single "
+                             "SB45_SIM_V4 per-window summary frame (per-type "
+                             "count buckets + coarse position). P2 events are "
+                             "coalesced into one frame per --p2-window-s window "
+                             "(peak-severity event; recorded in the summary's "
+                             "p2_present). Eases pressure on the radio's intake "
+                             "queue under high-density P1/P2 traffic. Default "
+                             "off.")
+    parser.add_argument("--batch-window-s", type=float, default=1800.0,
                         metavar="SEC",
                         help="Window size in elapsed seconds for --batch-p1. "
-                             "Default 300 (5 min). Ignored without --batch-p1.")
+                             "Default 1800 (30 min, SB45_SIM_V4 -- sized by the "
+                             "2026-06-07 capacity sim). Ignored without "
+                             "--batch-p1.")
+    parser.add_argument("--p2-window-s", type=float, default=120.0,
+                        metavar="SEC",
+                        help="P2 coalescing window in elapsed seconds for "
+                             "--batch-p1. P2 events in a window collapse to ONE "
+                             "frame (the peak-severity event), bounding P2's "
+                             "frame rate by the window cadence. Default 120 "
+                             "(sized against mu=1 frame/4min, 2026-06-10). "
+                             "0 = per-event real-time passthrough (legacy). "
+                             "Ignored without --batch-p1.")
+    parser.add_argument("--emit-empty-windows",
+                        action=argparse.BooleanOptionalAction, default=False,
+                        help="Emit a summary frame for every crossed window "
+                             "boundary even when no P1/P2 fired. Default OFF: "
+                             "empty windows were ~79%% of the 2026-06-10 3-Pi "
+                             "offered load and the radio's mu (1 frame / 4 min) "
+                             "cannot afford them. With --no-emit-empty-windows "
+                             "(the default) a window_idx gap is ambiguous "
+                             "between 'empty' and 'dropped'; pass "
+                             "--emit-empty-windows to restore gapless liveness "
+                             "breadcrumbs. Ignored without --batch-p1.")
+    # Retry-on-0x80 was removed 2026-06-07 (radio team: retry adds churn
+    # without goodput at saturation). The proactive controls are V4 per-window
+    # batching (--batch-p1) and the submission rate cap below.
+    parser.add_argument("--impact-cooldown-s", type=float, default=None,
+                        metavar="SEC",
+                        help="Override AnalyzerConfig.impact_cooldown_s (default "
+                             "45). Lower it (e.g. 2) to let a tight burst of "
+                             "severe_impacts fire on one node for stress tests. "
+                             "Test-only knob.")
+    parser.add_argument("--severe-impact-g", type=float, default=None,
+                        metavar="G",
+                        help="Override AnalyzerConfig.severe_impact_g (default "
+                             "0.45). TEST-ONLY: lower it (e.g. 0.45) to let a real "
+                             "drive's road bumps register as P2 for exercising the "
+                             "safety path -- do NOT lower it in production (real "
+                             "driving tops out ~1g; a crash is 10g+).")
+    parser.add_argument("--severe-jerk-g-s", type=float, default=None,
+                        metavar="GS",
+                        help="Override AnalyzerConfig.severe_jerk_g_s (default 1.0). "
+                             "Test-only companion to --severe-impact-g.")
+    parser.add_argument("--drain-timeout-s", type=float, default=0.0,
+                        metavar="SEC",
+                        help="At close, wait this long for every submitted frame "
+                             "to reach a terminal disposition before tearing down "
+                             "the socket. 0 (default) = UNLIMITED -- drain until "
+                             "the radio has delivered the whole backlog (Ctrl-C to "
+                             "stop). Set >0 to bound it (the old 5s behaviour: 5).")
+    parser.add_argument("--max-submit-rate-per-min", type=float, default=0.0,
+                        metavar="N",
+                        help="--transport ipc only. Cap submissions to N per "
+                             "minute (sliding 60s window). Helps prevent "
+                             "BUFFER_FULL in the first place. 0 = unlimited. "
+                             "Suggested starting point: 30 (one submit per "
+                             "2 sec). Honors radio team's app-side "
+                             "rate-limiting request. Default: 0.")
+    parser.add_argument("--p2-resubmit-backoff", type=str, default="15,60,120",
+                        metavar="S1,S2,...",
+                        help="--transport ipc only. Comma-separated backoff "
+                             "seconds for P2 resubmit on BUFFER_FULL; the last "
+                             "value is the cap for further attempts. Default "
+                             "'15,60,120' (deployed). The radio team's gentler "
+                             "'90,180,300' keeps the first retry >= the ~30s "
+                             "drain interval so a retry doesn't re-flood a queue "
+                             "that hasn't drained yet.")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
 
     if args.rate is not None and args.rate <= 0:
         parser.error(f"--rate must be positive (got {args.rate})")
+
+    try:
+        p2_backoff = tuple(
+            float(x) for x in args.p2_resubmit_backoff.split(","))
+        if not p2_backoff or any(x <= 0 for x in p2_backoff):
+            raise ValueError
+    except ValueError:
+        parser.error("--p2-resubmit-backoff must be comma-separated positive "
+                     f"seconds (got {args.p2_resubmit_backoff!r})")
 
     logging.basicConfig(
         level=getattr(logging, args.log_level),
@@ -143,18 +233,24 @@ def main() -> None:
             transport = IpcTransport(
                 endpoint_id=args.endpoint_id,
                 socket_path=args.socket,
+                max_submit_rate_per_min=args.max_submit_rate_per_min,
+                p2_resubmit_backoff=p2_backoff,
             )
         except ImportError as e:
             parser.error(f"--transport ipc requires skybounce-ipc-python: {e}")
             return  # unreachable; parser.error exits
         out_descr = f"IPC endpoint_id=0x{args.endpoint_id:08X}"
 
-    # Optionally wrap with the P1 batcher. P2 / LOG events still flow through
-    # to the underlying transport untouched; P1 events get accumulated into
-    # per-type 5-min summaries.
+    # Optionally wrap with the P1 batcher. P2 events still flow through to the
+    # underlying transport; P1 events get accumulated into one SB45_SIM_V4
+    # per-window (30-min) summary frame. (LOG events are dropped at the IPC
+    # wire, so over IPC they never go OTA regardless of batching.)
     if args.batch_p1:
         from skybounce_app_logistics.p1_batcher import P1BatchingTransport
-        transport = P1BatchingTransport(transport, window_s=args.batch_window_s)
+        transport = P1BatchingTransport(
+            transport, window_s=args.batch_window_s,
+            emit_empty_windows=args.emit_empty_windows,
+            p2_window_s=args.p2_window_s)
 
     print(f"Rules library: {RULES_VERSION}")
     print(f"Input:     {args.input}")
@@ -169,14 +265,19 @@ def main() -> None:
     else:
         print(f"Rate:      burst (as-fast-as-possible)")
 
-    cfg = AnalyzerConfig()
+    _cfg_overrides = {k: v for k, v in {
+        "impact_cooldown_s": args.impact_cooldown_s,
+        "severe_impact_g": args.severe_impact_g,
+        "severe_jerk_g_s": args.severe_jerk_g_s,
+    }.items() if v is not None}
+    cfg = AnalyzerConfig(**_cfg_overrides)
     frames = batch_frames(args.input)
     if args.rate is not None:
         frames = _pace_frames(frames, args.rate)
     try:
         run_engine(frames, transport=transport, cfg=cfg)
     finally:
-        transport.close()
+        transport.close(drain_timeout_s=args.drain_timeout_s)
 
     # event_count is exposed by FileTransport but not by every Transport (IPC,
     # batched wrappers). hasattr keeps this summary line useful when present
@@ -184,8 +285,8 @@ def main() -> None:
     if hasattr(transport, "event_count"):
         print(f"Records emitted: {transport.event_count}")
     if hasattr(transport, "summaries_emitted"):
-        print(f"  of which summaries: {transport.summaries_emitted}")
-        print(f"  P1 events absorbed into summaries: {transport.p1_events_seen}")
+        print(f"  summary frames: {transport.summaries_emitted} "
+              f"(absorbing {transport.p1_events_seen} P1 events)")
 
 
 if __name__ == "__main__":

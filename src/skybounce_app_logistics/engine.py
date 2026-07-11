@@ -27,8 +27,12 @@ from skybounce_event_rules import (
     is_gps_loss_while_moving,
     is_hard_accel,
     is_hard_brake,
+    is_moderate_accel,
+    is_moderate_brake,
     is_moderate_impact,
+    is_moderate_turn,
     is_severe_impact,
+    is_sharp_turn,
 )
 
 from .csv_source import SensorFrame
@@ -241,7 +245,12 @@ class StreamingEngine:
         t = feats.ts_epoch_s
         cfg = self.cfg
 
-        # Severe impact
+        # Severe impact -- the g/jerk gate is only a CANDIDATE. A real crash
+        # collapses speed; a hard bump (the old 0.45g threshold's false positives)
+        # doesn't. Resolve any prior candidate first, then hold a new one for
+        # speed-collapse confirmation instead of emitting immediately.
+        self._resolve_pending_severe(feats, t)
+
         fired, score, detail = is_severe_impact(
             lin_accel_g=feats.lin_accel_g,
             jerk_g_s=feats.jerk_g_s,
@@ -249,9 +258,12 @@ class StreamingEngine:
             gps_speed_m_s=feats.speed_m_s,
             cfg=cfg,
         )
-        if fired and cooldown_ok(self.state.last_event_ts, "severe_impact", t, cfg.impact_cooldown_s):
-            self._emit_event(feats, "severe_impact", score, detail)
-            return  # mirror analyzer's `continue`
+        if fired and self.state.pending_severe is None:
+            self.state.pending_severe = {
+                "ts": t, "speed": feats.speed_m_s,
+                "score": score, "detail": detail, "feats": feats,
+            }
+            return  # candidate preempts this frame's other point events
 
         # Moderate impact
         fired, score, detail = is_moderate_impact(
@@ -264,11 +276,20 @@ class StreamingEngine:
         if fired and cooldown_ok(self.state.last_event_ts, "moderate_impact", t, cfg.impact_cooldown_s):
             self._emit_event(feats, "moderate_impact", score, detail)
 
+        # v0_4_0 corroboration inputs shared by brake / accel / turn. The frame's
+        # own GPS quality (not the lagging smoothed confidence) plus a present
+        # location guard against degraded-fix speed glitches; mirrors the oracle.
+        frame_confident = feats.gps_quality_state == "GPS_CONFIDENT"
+        loc_present = frame.gps_lat is not None and frame.gps_lon is not None
+
         # Hard brake
         fired, score, detail = is_hard_brake(
             decel=feats.decel_m_s2,
             gps_confidence=feats.gps_confidence,
             cfg=cfg,
+            lin_accel_g=feats.lin_accel_g,
+            frame_gps_confident=frame_confident,
+            has_location=loc_present,
         )
         if fired and cooldown_ok(self.state.last_event_ts, "hard_brake", t, cfg.accel_event_cooldown_s):
             self._emit_event(feats, "hard_brake", score, detail)
@@ -278,9 +299,79 @@ class StreamingEngine:
             accel=feats.accel_m_s2,
             gps_confidence=feats.gps_confidence,
             cfg=cfg,
+            lin_accel_g=feats.lin_accel_g,
+            frame_gps_confident=frame_confident,
+            has_location=loc_present,
         )
         if fired and cooldown_ok(self.state.last_event_ts, "hard_accel", t, cfg.accel_event_cooldown_s):
             self._emit_event(feats, "hard_accel", score, detail)
+
+        # Sharp turn (v0_4_0): GPS heading-rate lateral acceleration.
+        fired, score, detail = is_sharp_turn(
+            lat_accel=feats.lat_accel_m_s2,
+            gps_confidence=feats.gps_confidence,
+            gps_speed_m_s=feats.speed_m_s,
+            cfg=cfg,
+            frame_gps_confident=frame_confident,
+            has_location=loc_present,
+        )
+        if fired and cooldown_ok(self.state.last_event_ts, "sharp_turn", t, cfg.turn_event_cooldown_s):
+            self._emit_event(feats, "sharp_turn", score, detail)
+
+        # Moderate (sub-hard) tiers -> P0 local context (logged, not transmitted).
+        fired, score, detail = is_moderate_brake(
+            decel=feats.decel_m_s2, gps_confidence=feats.gps_confidence, cfg=cfg,
+            lin_accel_g=feats.lin_accel_g, frame_gps_confident=frame_confident, has_location=loc_present,
+        )
+        if fired and cooldown_ok(self.state.last_event_ts, "moderate_brake", t, cfg.accel_event_cooldown_s):
+            self._emit_event(feats, "moderate_brake", score, detail)
+
+        fired, score, detail = is_moderate_accel(
+            accel=feats.accel_m_s2, gps_confidence=feats.gps_confidence, cfg=cfg,
+            lin_accel_g=feats.lin_accel_g, frame_gps_confident=frame_confident, has_location=loc_present,
+        )
+        if fired and cooldown_ok(self.state.last_event_ts, "moderate_accel", t, cfg.accel_event_cooldown_s):
+            self._emit_event(feats, "moderate_accel", score, detail)
+
+        fired, score, detail = is_moderate_turn(
+            lat_accel=feats.lat_accel_m_s2, gps_confidence=feats.gps_confidence,
+            gps_speed_m_s=feats.speed_m_s, cfg=cfg,
+            frame_gps_confident=frame_confident, has_location=loc_present,
+        )
+        if fired and cooldown_ok(self.state.last_event_ts, "moderate_turn", t, cfg.turn_event_cooldown_s):
+            self._emit_event(feats, "moderate_turn", score, detail)
+
+    def _resolve_pending_severe(self, feats: ComputedFeatures, t: float) -> None:
+        """Confirm or expire a held severe-impact candidate.
+
+        A real crash sheds speed fast; a hard bump doesn't. If speed has dropped
+        by >= severe_impact_speed_drop_m_s since the candidate fired, emit
+        severe_impact (P2, stamped at the impact frame). If the confirmation
+        window elapses with no collapse, the candidate was a bump -> emit it as
+        moderate_impact instead, so it's still recorded.
+        """
+        p = self.state.pending_severe
+        if p is None:
+            return
+        cfg = self.cfg
+        cur = feats.speed_m_s
+        if cur is not None and (p["speed"] - cur) >= cfg.severe_impact_speed_drop_m_s:
+            self.state.pending_severe = None
+            if cooldown_ok(self.state.last_event_ts, "severe_impact", p["ts"], cfg.impact_cooldown_s):
+                detail = f'{p["detail"]}, speed_drop={p["speed"] - cur:.1f} m/s (crash confirmed)'
+                self._emit_event(p["feats"], "severe_impact", p["score"], detail)
+            return
+        if (t - p["ts"]) > cfg.severe_impact_confirm_window_s:
+            self.state.pending_severe = None
+            fired, score, detail = is_moderate_impact(
+                lin_accel_g=p["feats"].lin_accel_g,
+                jerk_g_s=p["feats"].jerk_g_s,
+                gps_confidence=p["feats"].gps_confidence,
+                gps_speed_m_s=p["feats"].speed_m_s,
+                cfg=cfg,
+            )
+            if fired and cooldown_ok(self.state.last_event_ts, "moderate_impact", p["ts"], cfg.impact_cooldown_s):
+                self._emit_event(p["feats"], "moderate_impact", score, detail)
 
     # -------------------------------------------------------------------------
     # State / trip / stop / GPS episode tracking
@@ -559,6 +650,7 @@ class StreamingEngine:
             accel=feats.accel_m_s2,
             gps_confidence=feats.gps_confidence,
             has_location=has_loc,
+            lateral=feats.lat_accel_m_s2,
         )
 
         ev = Event(
@@ -575,6 +667,7 @@ class StreamingEngine:
             speed_mph=feats.speed_m_s * 2.23694,
             decel_m_s2=feats.decel_m_s2,
             accel_m_s2=feats.accel_m_s2,
+            lat_accel_m_s2=feats.lat_accel_m_s2,
             lin_accel_g=feats.lin_accel_g,
             jerk_g_s=feats.jerk_g_s,
             gps_confidence=feats.gps_confidence,

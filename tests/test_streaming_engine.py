@@ -138,11 +138,11 @@ class TestEngineEndToEnd:
         assert "moderate_impact" not in event_types
 
     def test_severe_impact_fires(self, tmp_path):
-        """Inject a synthetic severe impact and verify it's emitted.
+        """A crash-magnitude spike FOLLOWED BY a speed collapse fires severe_impact.
 
-        Severe needs lin_accel_g >= 0.45 AND jerk_g_s >= 1.0 in a moving state
-        with GPS confidence >= 0.70. Build a baseline of steady 1g, then
-        spike accel for one frame so both lin_accel and jerk cross thresholds.
+        Severe needs lin_accel_g >= severe_impact_g (3.0) AND jerk >= 1.0 in a
+        moving, GPS-trusted state, THEN a post-impact speed collapse to confirm
+        (a real crash stops the vehicle; a hard bump doesn't).
         """
         out_path = tmp_path / "events.jsonl"
         transport = FileTransport(out_path)
@@ -152,17 +152,17 @@ class TestEngineEndToEnd:
         for i in range(200):
             engine.consume(_moving_frame(ts=1000.0 + i, elapsed=0.0, speed_m_s=10.0))
 
-        # Spike: jump accel_mag from 1.0 (steady) to ~2.0 (big crash).
-        # accel_mag = sqrt(1.5^2 + 0 + 1.5^2) = ~2.12. lin_accel = 1.12, jerk = ~1.12 over 1s.
+        # Crash spike: accel_mag = sqrt(5^2 + 1^2) ~= 5.1g -> lin_accel ~4.1g,
+        # jerk ~4.1 g/s over 1s. Both clear the 3.0g / 1.0 g/s gate.
         spike = _moving_frame(ts=1200.0, elapsed=0.0, speed_m_s=10.0)
-        spike.accel_x_g = 1.5
+        spike.accel_x_g = 5.0
         spike.accel_y_g = 0.0
-        spike.accel_z_g = 1.5
+        spike.accel_z_g = 1.0
         engine.consume(spike)
 
-        # Trail off
+        # Speed collapses to 0 -> confirms the crash.
         for i in range(10):
-            engine.consume(_moving_frame(ts=1201.0 + i, elapsed=0.0, speed_m_s=10.0))
+            engine.consume(_moving_frame(ts=1201.0 + i, elapsed=0.0, speed_m_s=0.0))
 
         engine.flush()
         transport.close()
@@ -171,6 +171,34 @@ class TestEngineEndToEnd:
         events = [json.loads(line) for line in out_path.read_text().splitlines()]
         types = [e["event_type"] for e in events]
         assert "severe_impact" in types, f"expected severe_impact in events; got {types}"
+
+    def test_hard_bump_without_speed_collapse_is_moderate(self, tmp_path):
+        """A crash-magnitude spike with NO speed collapse is a bump, not a crash:
+        it must classify as moderate_impact and never severe_impact."""
+        out_path = tmp_path / "events.jsonl"
+        transport = FileTransport(out_path)
+        engine = StreamingEngine(transport=transport)
+
+        for i in range(200):
+            engine.consume(_moving_frame(ts=1000.0 + i, elapsed=0.0, speed_m_s=10.0))
+
+        spike = _moving_frame(ts=1200.0, elapsed=0.0, speed_m_s=10.0)
+        spike.accel_x_g = 5.0
+        spike.accel_z_g = 1.0
+        engine.consume(spike)
+
+        # Speed holds at 10 through the confirmation window -> no collapse.
+        for i in range(15):
+            engine.consume(_moving_frame(ts=1201.0 + i, elapsed=0.0, speed_m_s=10.0))
+
+        engine.flush()
+        transport.close()
+
+        import json
+        events = [json.loads(line) for line in out_path.read_text().splitlines()]
+        types = [e["event_type"] for e in events]
+        assert "severe_impact" not in types, f"bump must not be severe; got {types}"
+        assert "moderate_impact" in types, f"bump should fall back to moderate; got {types}"
 
     def test_cooldown_suppresses_duplicate_fires(self, tmp_path):
         """Two consecutive severe-impact spikes within cooldown -> only one event."""
@@ -181,21 +209,24 @@ class TestEngineEndToEnd:
         for i in range(200):
             engine.consume(_moving_frame(ts=1000.0 + i, elapsed=0.0, speed_m_s=10.0))
 
-        # First spike (will fire)
-        spike1 = _moving_frame(ts=1200.0, elapsed=0.0, speed_m_s=10.0)
-        spike1.accel_x_g = 1.5
-        spike1.accel_z_g = 1.5
-        engine.consume(spike1)
-        # Recover to baseline
-        engine.consume(_moving_frame(ts=1201.0, elapsed=0.0, speed_m_s=10.0))
-        # Second spike 10 seconds later (within 45s impact_cooldown_s -> suppressed)
-        spike2 = _moving_frame(ts=1210.0, elapsed=0.0, speed_m_s=10.0)
-        spike2.accel_x_g = 1.5
-        spike2.accel_z_g = 1.5
-        engine.consume(spike2)
+        def crash(ts):
+            s = _moving_frame(ts=ts, elapsed=0.0, speed_m_s=10.0)
+            s.accel_x_g = 5.0
+            s.accel_z_g = 1.0
+            return s
 
+        # First crash: spike then speed collapse -> confirms severe #1.
+        engine.consume(crash(1200.0))
+        for i in range(3):
+            engine.consume(_moving_frame(ts=1201.0 + i, elapsed=0.0, speed_m_s=0.0))
+        # Vehicle recovers (moving again) so the next spike is a fresh candidate.
+        for i in range(3):
+            engine.consume(_moving_frame(ts=1204.0 + i, elapsed=0.0, speed_m_s=10.0))
+        # Second crash 10s after the first (within 45s impact_cooldown_s): it
+        # confirms via collapse but the cooldown suppresses the duplicate.
+        engine.consume(crash(1210.0))
         for i in range(5):
-            engine.consume(_moving_frame(ts=1211.0 + i, elapsed=0.0, speed_m_s=10.0))
+            engine.consume(_moving_frame(ts=1211.0 + i, elapsed=0.0, speed_m_s=0.0))
 
         engine.flush()
         transport.close()

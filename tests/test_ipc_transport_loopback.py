@@ -115,6 +115,9 @@ class MockSkyBounce:
         self._conn: socket.socket | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self.buffer_full_count = 0
+        self._buffer_full_remaining = 0
+        self._silent = False
 
     # ---- lifecycle -----------------------------------------------------------
 
@@ -187,6 +190,16 @@ class MockSkyBounce:
     def inject_ping(self, token: int) -> None:
         self._send(MsgType.PING, PingPong(token=token).pack())
 
+    def set_buffer_full(self, count: int) -> None:
+        """Make the next `count` TELEMETRY submissions respond with
+        DROPPED_BUFFER_FULL instead of QUEUED+DELIVERED."""
+        self._buffer_full_remaining = count
+
+    def set_silent(self, on: bool = True) -> None:
+        """Receive TELEMETRY but send NO ACK -- frames stay in-flight forever.
+        Used to exercise the close()-drain exit on peer disconnect."""
+        self._silent = on
+
     # ---- session loop --------------------------------------------------------
 
     def _serve(self) -> None:
@@ -241,8 +254,20 @@ class MockSkyBounce:
         if msg_type == MsgType.TELEMETRY:
             tel = Telemetry.unpack(payload)
             self.received_telemetry.append(tel)
-            # ACK with QUEUED then DELIVERED; small spacing so the client
-            # logs them as discrete events.
+            if self._silent:
+                return  # receive but never ACK -> frame stays in-flight
+            if self._buffer_full_remaining > 0:
+                self._buffer_full_remaining -= 1
+                self.buffer_full_count += 1
+                self._send(
+                    MsgType.TELEMETRY_ACK,
+                    TelemetryAck(
+                        telemetry_id=tel.telemetry_id,
+                        disposition=int(Disposition.DROPPED_BUFFER_FULL),
+                        reason_code=0x0002,
+                    ).pack(),
+                )
+                return
             for disp in (Disposition.QUEUED, Disposition.DELIVERED):
                 self._send(
                     MsgType.TELEMETRY_ACK,
@@ -407,9 +432,15 @@ def test_close_drains_pending_telemetry(loopback):
     Regression test for the close-race observed during 2026-05-27 Pi
     validation, where a 4-event burst landed only 1 frame on the mock
     side. With the drain, all N must arrive before close() returns.
+
+    Each P2 event emits exactly one telemetry frame. The precise-position
+    companion was removed 2026-06-10 (mu=1 frame/4min capacity), so N events
+    produce N_FRAMES = N on the wire.
     """
     transport, mock = loopback
     N = 5
+    # P2 event → one frame (no precise-position companion since 2026-06-10)
+    N_FRAMES = N
 
     for _ in range(N):
         transport.emit(_make_event())
@@ -419,13 +450,79 @@ def test_close_drains_pending_telemetry(loopback):
     # a ~20ms cadence, so total drain wait should be well under a second.
     transport.close()
 
-    assert len(mock.received_telemetry) == N, (
-        f"expected {N} TELEMETRY frames on mock side after close; got "
+    assert len(mock.received_telemetry) == N_FRAMES, (
+        f"expected {N_FRAMES} TELEMETRY frames on mock side after close; got "
         f"{len(mock.received_telemetry)} "
         f"(ids={[t.telemetry_id for t in mock.received_telemetry]})"
     )
     delivered = int(Disposition.DELIVERED)
-    assert transport.ack_counts.get(delivered, 0) == N, (
-        f"expected {N} DELIVERED ACKs accounted for in transport; "
+    assert transport.ack_counts.get(delivered, 0) == N_FRAMES, (
+        f"expected {N_FRAMES} DELIVERED ACKs accounted for in transport; "
         f"got ack_counts={transport.ack_counts}"
     )
+
+
+def test_p2_resubmit_on_buffer_full(loopback):
+    """A CRITICAL (P2) frame that gets DROPPED_BUFFER_FULL is automatically
+    resubmitted by the transport's P2 resubmit thread. The mock rejects the
+    first submission with BUFFER_FULL, then accepts the resubmit with
+    QUEUED+DELIVERED. The event data and priority make it CRITICAL (P2), so
+    the resubmit path fires.
+
+    Validates: unbounded P2 resubmit (transport._resubmit_count > 0,
+    the frame ultimately DELIVERED).
+    """
+    transport, mock = loopback
+    # Use a fast resubmit backoff so the test doesn't wait the deployed
+    # 15s first step. The resubmit loop reads this attribute each iteration,
+    # so overriding it post-construction (before the resubmit fires) is safe.
+    transport._P2_RESUBMIT_BACKOFF_SCHEDULE = (0.05,)
+    # First P2 event submission → BUFFER_FULL; next submission (the
+    # resubmit) → normal QUEUED+DELIVERED. Since 2026-06-10 a P2 event is a
+    # single frame (no precise-position companion), so reject just one.
+    mock.set_buffer_full(1)
+    transport.emit(_make_event())  # P2 event → one frame
+
+    # Wait for the resubmit thread to re-submit and the mock to DELIVER.
+    assert _wait_until(
+        lambda: transport._resubmit_count >= 1, timeout_s=5.0
+    ), (
+        f"expected >=1 resubmission; got {transport._resubmit_count} "
+        f"(ack_counts={transport.ack_counts})"
+    )
+    # The original attempt and the resubmit each arrive on the mock side.
+    # Original: 1 frame (rejected). Resubmit: 1 frame (accepted).
+    assert len(mock.received_telemetry) >= 2, (
+        f"expected >=2 TELEMETRY frames (1 rejected + 1 resubmitted); "
+        f"got {len(mock.received_telemetry)}"
+    )
+    delivered = int(Disposition.DELIVERED)
+    assert _wait_until(
+        lambda: transport.ack_counts.get(delivered, 0) >= 1, timeout_s=3.0
+    ), (
+        f"resubmitted frame should reach DELIVERED; "
+        f"ack_counts={transport.ack_counts}"
+    )
+
+
+def test_close_exits_on_peer_disconnect_without_hanging(loopback):
+    """close()'s unlimited drain must NOT hang when the peer disconnects while a
+    frame is still in-flight. The client drops frames composed while not STEADY,
+    so a stranded frame can never reach a terminal ACK; close() must detect the
+    disconnect, count it dropped, and return. Regression for the 2026-06-11
+    mid-drain bridge teardown that wedged the sender until SIGKILL."""
+    transport, mock = loopback
+    mock.set_silent(True)              # receive but never ACK -> in-flight forever
+    transport.emit(_make_event())      # P2 submitted, no terminal disposition
+    assert _wait_until(
+        lambda: len(mock.received_telemetry) >= 1, timeout_s=2.0
+    ), "mock never received the frame"
+
+    mock.stop()                        # peer disconnects mid-flight
+
+    t0 = time.monotonic()
+    transport.close()                  # unlimited drain (default); must return
+    elapsed = time.monotonic() - t0
+    assert elapsed < 8.0, f"close() hung {elapsed:.1f}s after peer disconnect"
+    # the stranded frame was never DELIVERED -- it's counted dropped at close
+    assert transport.ack_counts.get(int(Disposition.DELIVERED), 0) == 0
